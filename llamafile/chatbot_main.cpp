@@ -186,7 +186,7 @@ int main(int argc, char **argv) {
 
     print_ephemeral("loading model...");
     llama_model_params model_params = common_model_params_to_llama(*g_params);
-    g_model = llama_model_load_from_file(g_params->model.path.c_str(), model_params);
+    g_model = llamafile_model_load(g_params->model.path.c_str(), model_params);
     clear_ephemeral();
     if (g_model == NULL) {
         fprintf(stderr, "%s: failed to load model%s\n", g_params->model.path.c_str(), tip());

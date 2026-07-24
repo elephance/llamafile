@@ -16,6 +16,10 @@
 // limitations under the License.
 
 #pragma once
+// Pull in the real llama API (llama_model_params, etc.).
+// Cannot use #include "llama.h" here because this file IS llamafile/llama.h;
+// use the relative path to reach llama.cpp/include/llama.h directly.
+#include "../llama.cpp/include/llama.h"
 #include <string>
 #include <string_view>
 #include <vector>
@@ -38,8 +42,12 @@
 #define RENDER_SPECIAL_TOKENS true
 #define DONT_RENDER_SPECIAL_TOKENS false
 
-struct llama_model;
-struct llama_context;
+// Load a model from `path`.  If the filename ends with ".twzm" the file is
+// treated as a Twizzler Memory Object (TWZM format) and loaded via
+// llama_model_load_from_twzm_path(); otherwise llama_model_load_from_file()
+// is called.  This is the preferred model-loading entry point within llamafile.
+struct llama_model * llamafile_model_load(const char * path,
+                                          struct llama_model_params params);
 
 int llamafile_token_eot(llama_model *);
 

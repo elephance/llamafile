@@ -17,9 +17,19 @@
 
 #include "llama.h"   // llamafile wrapper
 #include "common.h"  // llama.cpp common (pulls in llama.h types)
+#include "twizzler.h"
 #include <cassert>
+#include <cstring>
 #include <string>
 #include <vector>
+
+struct llama_model * llamafile_model_load(const char * path,
+                                          struct llama_model_params params) {
+    const char * ext = strrchr(path, '.');
+    if (ext && strcmp(ext, ".twzm") == 0)
+        return llama_model_load_from_twzm_path(path, params);
+    return llama_model_load_from_file(path, params);
+}
 
 int llamafile_token_eot(llama_model *model) {
     const llama_vocab *vocab = llama_model_get_vocab(model);

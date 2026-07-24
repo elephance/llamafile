@@ -1,0 +1,132 @@
+// Copyright 2026 Mozilla.ai
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Twizzler Memory Object loader for llama.cpp models.
+//
+// The TWZM (Twizzler Model) format is a self-contained binary object that
+// stores a llama.cpp model and can be directly memory-mapped.  The format
+// embeds:
+//   - A fixed 64-byte header (magic, version, field offsets).
+//   - A tensor index (name → in-object offset lookup table).
+//   - A GGUF metadata blob (all KV pairs + tensor info headers, no data).
+//   - Page-aligned tensor data regions (zero-copy mappable).
+//
+// On Twizzler OS the object is identified by a 128-bit ObjID and mapped
+// via native Twizzler syscalls.  On Linux a file-backed shim is provided
+// for development and testing (see TWZ_OBJECT_PATH).
+//
+// Loading flow:
+//   1. twz_object_map()         – map the object into address space.
+//   2. gguf_init_from_buffer()  – parse embedded GGUF metadata blob.
+//   3. llama_model_init_from_user() – build llama_model from metadata +
+//        set_tensor_data_cb that sets tensor->data pointers into the map.
+//   4. twz_object_unmap()       – called by TwzmModel destructor.
+
+#pragma once
+
+// Use the relative path to reach the real llama API header.
+// Cannot use #include "llama.h" here because llamafile/llama.h (a small
+// helpers-only file) shadows llama.cpp/include/llama.h in the include search.
+#include "../llama.cpp/include/llama.h"
+
+#include <stddef.h>
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+// ---------------------------------------------------------------------------
+// Twizzler object identity
+// ---------------------------------------------------------------------------
+
+// A Twizzler Object ID is a 128-bit value.  On Linux the hi/lo pair encodes
+// an opaque handle; twz_object_map() resolves it to a file path under the
+// directory named by the TWZ_OBJECT_PATH environment variable (default: ".").
+typedef struct {
+    uint64_t hi;
+    uint64_t lo;
+} twz_objid;
+
+// ---------------------------------------------------------------------------
+// On-disk / in-object format structs
+//
+// All multi-byte integers are stored little-endian (native on x86/ARM).
+// ---------------------------------------------------------------------------
+
+#define TWZM_MAGIC   0x4D5A5754u  // "TWZM" (little-endian)
+#define TWZM_VERSION 1u
+
+#define TWZM_TENSOR_NAME_MAX 96   // maximum tensor name length incl. NUL
+
+// Fixed-size object header at byte 0.
+typedef struct __attribute__((packed)) {
+    uint32_t magic;               // Must equal TWZM_MAGIC.
+    uint32_t version;             // Must equal TWZM_VERSION.
+    uint64_t metadata_offset;     // Byte offset to the GGUF metadata blob.
+    uint64_t metadata_size;       // Byte length of the GGUF metadata blob.
+    uint64_t tensor_index_offset; // Byte offset to the tensor index array.
+    uint64_t tensor_count;        // Number of entries in the tensor index.
+    uint8_t  reserved[24];        // Pad to 64 bytes; must be zero.
+} TwzmHeader;
+
+// One entry in the tensor index.
+typedef struct __attribute__((packed)) {
+    char     name[TWZM_TENSOR_NAME_MAX]; // Tensor name (null-terminated).
+    uint64_t data_offset;                // Byte offset within the object.
+    uint64_t data_size;                  // Byte length of the tensor data.
+} TwzmTensorEntry;
+
+// Alignment for tensor data regions (must be a power of two).
+#define TWZM_DATA_ALIGNMENT 4096u
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+// Load a llama_model from a Twizzler memory object identified by `id`.
+//
+// On Twizzler OS, `id` is mapped via the native object API.
+// On Linux, `id` is resolved to a file path and mmap'd (see twizzler_platform.h).
+//
+// The returned model must be freed with llama_model_free().  The caller must
+// NOT unmap the underlying object while the model is live; ownership of the
+// mapping is transferred to the returned model (via a custom deleter).
+//
+// Returns NULL on failure (error is logged to stderr).
+struct llama_model * llama_model_load_from_twizzler_object(
+    twz_objid id,
+    struct llama_model_params params);
+
+// Load directly from a .twzm file path on the local filesystem.
+// The file is mmap'd read-only; the mapping is retained for the model's
+// lifetime (released on process exit).  Callers needing explicit lifetime
+// control should use llama_model_load_from_twzm() with a caller-managed map.
+// Returns NULL on failure (error is logged to stderr).
+struct llama_model * llama_model_load_from_twzm_path(
+    const char * path,
+    struct llama_model_params params);
+
+// Lower-level variant that operates on an already-mapped region.
+// `base` must point to the start of a mapped TWZM object of `size` bytes.
+// The caller retains ownership of the mapping; it must remain valid for the
+// lifetime of the returned model.
+struct llama_model * llama_model_load_from_twzm(
+    const void * base,
+    size_t size,
+    struct llama_model_params params);
+
+#ifdef __cplusplus
+} // extern "C"
+#endif

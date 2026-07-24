@@ -32,6 +32,7 @@
 
 #include "chatbot.h"
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -131,6 +132,16 @@ static void cleanup(mtmd_context *mtmd_ctx, common_sampler *sampler,
 int cli_main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
 
+    auto t_start = std::chrono::steady_clock::now();
+    auto t_stage = t_start;
+    auto log_stage = [&](const char *name) {
+        auto now = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(now - t_stage).count();
+        double total = std::chrono::duration<double, std::milli>(now - t_start).count();
+        fprintf(stderr, "[timing] %-30s %8.1f ms  (total: %.1f ms)\n", name, ms, total);
+        t_stage = now;
+    };
+
     // Parse flags quietly (no logo, no ephemeral messages)
     common_params params;
     params.sampling.n_prev = 64;
@@ -156,6 +167,7 @@ int cli_main(int argc, char **argv) {
         fprintf(stderr, "error: failed to parse arguments\n");
         return 1;
     }
+    log_stage("parse arguments");
 
     // Check that a prompt was provided
     if (params.prompt.empty()) {
@@ -181,26 +193,30 @@ int cli_main(int argc, char **argv) {
 
     // Load model
     llama_model_params model_params = common_model_params_to_llama(params);
-    llama_model *model = llama_model_load_from_file(params.model.path.c_str(), model_params);
+    llama_model *model = llamafile_model_load(params.model.path.c_str(), model_params);
     if (!model) {
         fprintf(stderr, "error: failed to load model: %s\n", params.model.path.c_str());
         return 2;
     }
+    log_stage("load model");
 
     // Adjust context size
     if (params.n_ctx <= 0 || params.n_ctx > (int)llama_model_n_ctx_train(model))
         params.n_ctx = llama_model_n_ctx_train(model);
     if (params.n_ctx < params.n_batch)
         params.n_batch = params.n_ctx;
+    log_stage("adjust context size");
 
     // Create context
     llama_context_params ctx_params = common_context_params_to_llama(params);
+    log_stage("create context");
     llama_context *ctx = llama_init_from_model(model, ctx_params);
     if (!ctx) {
         fprintf(stderr, "error: failed to create context\n");
         cleanup(nullptr, nullptr, nullptr, model);
         return 3;
     }
+    log_stage("llama init");
 
     // Initialize sampler
     common_sampler *sampler = common_sampler_init(model, params.sampling);
@@ -209,6 +225,7 @@ int cli_main(int argc, char **argv) {
         cleanup(nullptr, nullptr, ctx, model);
         return 4;
     }
+    log_stage("init sampler");
 
     // Initialize multimodal context and load images if provided
     mtmd_context *mtmd_ctx = nullptr;
@@ -238,6 +255,7 @@ int cli_main(int argc, char **argv) {
             cleanup(nullptr, sampler, ctx, model);
             return 5;
         }
+        log_stage("load vision model");
 
         // Load image bitmaps
         for (const auto &image_path : params.image) {
@@ -251,6 +269,7 @@ int cli_main(int argc, char **argv) {
             }
             bitmaps.entries.push_back(std::move(bmp));
         }
+        log_stage("load images");
     } else if (!params.mmproj.path.empty()) {
         LOG_INF("--mmproj specified without --image, vision model will not be loaded\n");
     }
@@ -308,6 +327,7 @@ int cli_main(int argc, char **argv) {
         // Base model: use prompt as-is
         formatted_prompt = user_prompt;
     }
+    log_stage("build prompt");
 
     // Tokenize and evaluate prompt
     llama_pos n_past = 0;
@@ -361,6 +381,7 @@ int cli_main(int argc, char **argv) {
             return 6;
         }
         n_past = new_n_past;
+        log_stage("evaluate prompt (multimodal)");
     } else {
         // Plain text tokenization
         std::vector<llama_token> tokens = llamafile_tokenize(model, formatted_prompt, false, true);
@@ -388,6 +409,7 @@ int cli_main(int argc, char **argv) {
             }
         }
         n_past = tokens.size();
+        log_stage("evaluate prompt (text)");
     }
 
     // Install signal handler for graceful interrupt
@@ -471,11 +493,14 @@ int cli_main(int argc, char **argv) {
     // Ensure output ends with newline
     printf("\n");
 
+    log_stage("generate response");
+
     // Restore signal handler
     sigaction(SIGINT, &old_sa, nullptr);
 
     // Cleanup
     cleanup(mtmd_ctx, sampler, ctx, model);
+    log_stage("cleanup");
     llama_backend_free();
 
     return 0;

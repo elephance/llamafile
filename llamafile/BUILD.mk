@@ -145,6 +145,8 @@ LLAMAFILE_SRCS_C := \
 LLAMAFILE_SRCS_CPP := \
 	llamafile/args.cpp \
 	llamafile/chatbot_api.cpp \
+	llamafile/twizzler.cpp \
+	llamafile/twizzler_linux.cpp \
 	llamafile/chatbot_cli.cpp \
 	llamafile/chatbot_comm.cpp \
 	llamafile/chatbot_comp.cpp \
@@ -466,5 +468,32 @@ o/$(MODE)/llamafile/iqk_mul_mat_arm82.o: \
 # Targets
 # ==============================================================================
 
+# ==============================================================================
+# gguf-to-twzm: GGUF → TWZM conversion tool
+# ==============================================================================
+# Minimal dependencies: only ggml (for GGUF parsing) and llama (for
+# llama_model_init_from_user).  Does not pull in the TUI, server, or GPU stack.
+
+GGUF_TO_TWZM_OBJS = \
+	o/$(MODE)/llamafile/gguf_to_twzm.o
+
+GGUF_TO_TWZM_DEPS = \
+	$(GGML_OBJS) \
+	$(LLAMA_OBJS) \
+	$(LLAMAFILE_GPU_OBJS) \
+	$(TINYBLAS_CPU_OBJS) \
+	o/$(MODE)/llamafile/llamafile.o \
+	o/$(MODE)/llamafile/zip.o
+
+o/$(MODE)/llamafile/gguf_to_twzm.o: llamafile/gguf_to_twzm.cpp
+	@mkdir -p $(@D)
+	$(CXX) $(CXXFLAGS) $(LLAMAFILE_INCLUDES) -c -o $@ $<
+
+o/$(MODE)/llamafile/gguf-to-twzm: \
+		$(GGUF_TO_TWZM_OBJS) \
+		$(GGUF_TO_TWZM_DEPS)
+	@mkdir -p $(@D)
+	$(CXX) $(LDFLAGS) -o $@ $(filter %.o %.a,$^) $(LDLIBS)
+
 .PHONY: o/$(MODE)/llamafile
-o/$(MODE)/llamafile: o/$(MODE)/llamafile/llamafile
+o/$(MODE)/llamafile: o/$(MODE)/llamafile/llamafile o/$(MODE)/llamafile/gguf-to-twzm
