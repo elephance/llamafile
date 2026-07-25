@@ -78,7 +78,12 @@ typedef struct __attribute__((packed)) {
     uint64_t metadata_size;       // Byte length of the GGUF metadata blob.
     uint64_t tensor_index_offset; // Byte offset to the tensor index array.
     uint64_t tensor_count;        // Number of entries in the tensor index.
-    uint8_t  reserved[24];        // Pad to 64 bytes; must be zero.
+    // Process-local model pointer cache.  Written at runtime via a COW page
+    // (MAP_PRIVATE, so the on-disk file is never modified).  On Twizzler this
+    // would be a persistent pointer fixed up on remap.  Zero means uncached.
+    uint64_t cached_model_ptr;
+    uint64_t vocab_offset;        // Byte offset to flat vocab section (0 = absent).
+    uint64_t vocab_size;          // Byte length of flat vocab section.
 } TwzmHeader;
 
 // One entry in the tensor index.
@@ -90,6 +95,36 @@ typedef struct __attribute__((packed)) {
 
 // Alignment for tensor data regions (must be a power of two).
 #define TWZM_DATA_ALIGNMENT 4096u
+
+// ---------------------------------------------------------------------------
+// Flat vocab section format (at vocab_offset in the TWZM object)
+//
+// The vocab section lets the loader skip gguf_init_from_buffer and load_vocab
+// entirely on first load, avoiding 150ms+ of hash-table construction.
+//
+// Layout:
+//   TwzmVocabHeader  (32 bytes, fixed)
+//   id_data[]        (n_vocab × 12 bytes)  score+attr+text_offset per token
+//   merges[]         (n_merges × 4 bytes)  text_offset of "p1 p2\0" merge string
+//   text_pool        (text_pool_size bytes) all strings, null-terminated
+// ---------------------------------------------------------------------------
+
+#define TWZM_VOCAB_MAGIC 0x4D435657u  // "WVCM"
+
+typedef struct __attribute__((packed)) {
+    uint32_t magic;           // TWZM_VOCAB_MAGIC
+    uint32_t n_vocab;
+    uint32_t vocab_type;      // llama_vocab_type enum
+    uint32_t n_merges;
+    uint32_t text_pool_size;
+    uint32_t reserved[3];     // pad to 32 bytes
+} TwzmVocabHeader;
+
+typedef struct __attribute__((packed)) {
+    float    score;
+    int32_t  attr;            // llama_token_attr flags
+    uint32_t text_offset;     // byte offset into text_pool
+} TwzmTokenData;
 
 // ---------------------------------------------------------------------------
 // Public API

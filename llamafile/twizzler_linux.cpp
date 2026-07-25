@@ -39,6 +39,8 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <string>
+#include <unordered_map>
 
 // Build the file path for an object ID.
 // Returns 1 on success, 0 if the path would overflow buf_size.
@@ -52,6 +54,12 @@ static int twz_object_path(twz_objid id, char * buf, size_t buf_size) {
     return n > 0 && (size_t)n < buf_size;
 }
 
+// Per-process table of open TWZM mappings keyed by file path.
+// Keeping the same mapping alive lets llama_model_load_from_twzm() find the
+// cached_model_ptr it wrote into the header on first load.
+struct TwzmMapping { void * base; size_t size; };
+static std::unordered_map<std::string, TwzmMapping> g_twzm_mappings;
+
 void * twz_object_map(twz_objid id, size_t * out_size) {
     *out_size = 0;
 
@@ -60,6 +68,13 @@ void * twz_object_map(twz_objid id, size_t * out_size) {
         fprintf(stderr, "twz_object_map: path too long for object %016" PRIx64
                 "_%016" PRIx64 "\n", id.hi, id.lo);
         return NULL;
+    }
+
+    // Re-use an existing mapping for this path if we have one.
+    auto it = g_twzm_mappings.find(path);
+    if (it != g_twzm_mappings.end()) {
+        *out_size = it->second.size;
+        return it->second.base;
     }
 
     int fd = open(path, O_RDONLY | O_CLOEXEC);
@@ -84,8 +99,10 @@ void * twz_object_map(twz_objid id, size_t * out_size) {
     }
 
     size_t sz = (size_t)st.st_size;
-    void * ptr = mmap(NULL, sz, PROT_READ, MAP_PRIVATE, fd, 0);
-    close(fd); // fd can be closed immediately after mmap
+    // MAP_PRIVATE + PROT_WRITE: writes are copy-on-write (never touch the file).
+    // This lets us cache llama_model* in the header's reserved field at runtime.
+    void * ptr = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+    close(fd);
 
     if (ptr == MAP_FAILED) {
         fprintf(stderr, "twz_object_map: mmap '%s' (%zu bytes) failed: %s\n",
@@ -93,6 +110,7 @@ void * twz_object_map(twz_objid id, size_t * out_size) {
         return NULL;
     }
 
+    g_twzm_mappings[path] = {ptr, sz};
     *out_size = sz;
     return ptr;
 }

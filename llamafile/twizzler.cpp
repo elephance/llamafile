@@ -43,15 +43,16 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <cinttypes>
 #include <cstdio>
 #include <cstring>
+#include <cerrno>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
-#include <vector>
 
 // Set TWZM_DEBUG=1 in the environment to enable verbose tracing.
 static int twzm_debug_level() {
@@ -65,28 +66,34 @@ static int twzm_debug_level() {
 #define TWZM_LOG(fmt, ...) \
     do { if (twzm_debug_level() > 0) fprintf(stderr, "twzm: " fmt "\n", ##__VA_ARGS__); } while (0)
 
+#define TWZM_LOG_V(fmt, ...) \
+    do { if (twzm_debug_level() > 1) fprintf(stderr, "twzm: " fmt "\n", ##__VA_ARGS__); } while (0)
 // ---------------------------------------------------------------------------
-// Internal loader state
+// Internal loader state — zero dynamic allocation
 // ---------------------------------------------------------------------------
 
+// The tensor index in the TWZM file is sorted by name at conversion time.
+// We keep a direct pointer into the mmap'd object and use bsearch().
 struct TwzmLoader {
-    const uint8_t      * base = nullptr;
-    size_t               size = 0;
-    const gguf_context * gguf_ctx = nullptr; // borrowed; used to classify missing tensors
+    const uint8_t         * base    = nullptr;
+    size_t                  size    = 0;
+    const TwzmTensorEntry * entries = nullptr; // pointer directly into mmap'd object
+    uint64_t                count   = 0;
+    const gguf_context    * gguf_ctx = nullptr; // borrowed; used to classify missing tensors
 
-    // Map from tensor name to its data region within the object.
-    struct Region {
-        const uint8_t * ptr;
-        size_t          len;
-    };
-    std::unordered_map<std::string, Region> tensor_map;
-
-    // Open and validate a mapped TWZM object.
-    // gguf is the already-parsed metadata context; we borrow it to validate
-    // "not found" lookups at set_tensor_data time.
-    // Returns true on success; logs an error and returns false on failure.
     bool open(const void * base_ptr, size_t sz, const gguf_context * gguf);
 };
+
+static int twzm_entry_cmp(const void * key, const void * elem) {
+    return strcmp(static_cast<const char *>(key),
+                  static_cast<const TwzmTensorEntry *>(elem)->name);
+}
+
+static const TwzmTensorEntry * twzm_lookup(const TwzmLoader * loader, const char * name) {
+    return static_cast<const TwzmTensorEntry *>(
+        bsearch(name, loader->entries, loader->count,
+                sizeof(TwzmTensorEntry), twzm_entry_cmp));
+}
 
 bool TwzmLoader::open(const void * base_ptr, size_t sz, const gguf_context * gguf) {
     base     = static_cast<const uint8_t *>(base_ptr);
@@ -115,51 +122,42 @@ bool TwzmLoader::open(const void * base_ptr, size_t sz, const gguf_context * ggu
 
     // -- Validate metadata blob bounds ------------------------------------
     if (hdr.metadata_offset + hdr.metadata_size > sz) {
-        fprintf(stderr, "twzm: metadata blob [%" PRIu64 ", %" PRIu64 ") out of bounds\n",
-                hdr.metadata_offset, hdr.metadata_offset + hdr.metadata_size);
+        fprintf(stderr, "twzm: metadata blob out of bounds\n");
         return false;
     }
 
-    // -- Validate and parse tensor index ----------------------------------
+    // -- Bind and validate tensor index -----------------------------------
     uint64_t index_bytes = hdr.tensor_count * sizeof(TwzmTensorEntry);
     if (hdr.tensor_index_offset + index_bytes > sz) {
-        fprintf(stderr, "twzm: tensor index [%" PRIu64 ", %" PRIu64 ") out of bounds\n",
-                hdr.tensor_index_offset, hdr.tensor_index_offset + index_bytes);
+        fprintf(stderr, "twzm: tensor index out of bounds\n");
         return false;
     }
 
-    const TwzmTensorEntry * entries =
-        reinterpret_cast<const TwzmTensorEntry *>(base + hdr.tensor_index_offset);
+    entries = reinterpret_cast<const TwzmTensorEntry *>(base + hdr.tensor_index_offset);
+    count   = hdr.tensor_count;
 
-    tensor_map.reserve(static_cast<size_t>(hdr.tensor_count));
-    for (uint64_t i = 0; i < hdr.tensor_count; ++i) {
+    // Validate each entry and confirm the index is sorted (required for bsearch).
+    for (uint64_t i = 0; i < count; ++i) {
         const TwzmTensorEntry & e = entries[i];
-
-        // Validate name is null-terminated within bounds.
         if (strnlen(e.name, TWZM_TENSOR_NAME_MAX) == TWZM_TENSOR_NAME_MAX) {
-            fprintf(stderr, "twzm: tensor index entry %" PRIu64 " name is not null-terminated\n", i);
+            fprintf(stderr, "twzm: entry %" PRIu64 " name is not null-terminated\n", i);
             return false;
         }
-        // Validate data region bounds.
         if (e.data_offset + e.data_size > sz) {
-            fprintf(stderr, "twzm: tensor '%s' data [%" PRIu64 ", %" PRIu64 ") out of bounds\n",
-                    e.name, e.data_offset, e.data_offset + e.data_size);
+            fprintf(stderr, "twzm: tensor '%s' data out of bounds\n", e.name);
             return false;
         }
-
-        tensor_map[std::string(e.name)] = Region{
-            base + e.data_offset,
-            static_cast<size_t>(e.data_size)
-        };
+        if (i > 0 && strcmp(entries[i-1].name, e.name) >= 0) {
+            fprintf(stderr, "twzm: index not sorted at entry %" PRIu64 "\n", i);
+            return false;
+        }
     }
 
-    TWZM_LOG("loaded %" PRIu64 " tensor(s) from index", hdr.tensor_count);
+    TWZM_LOG("loaded %" PRIu64 " tensor(s) from sorted index", count);
     if (twzm_debug_level() > 1) {
-        for (const auto & kv : tensor_map) {
-            fprintf(stderr, "twzm:   [index] %-48s  off=%" PRIu64 "  len=%zu\n",
-                    kv.first.c_str(),
-                    (uint64_t)(kv.second.ptr - base),
-                    kv.second.len);
+        for (uint64_t i = 0; i < count; ++i) {
+            fprintf(stderr, "twzm:   [index] %-48s  off=%" PRIu64 "  len=%" PRIu64 "\n",
+                    entries[i].name, entries[i].data_offset, entries[i].data_size);
         }
     }
 
@@ -178,41 +176,47 @@ static void twzm_set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
     TwzmLoader * loader = static_cast<TwzmLoader *>(userdata);
     const char * name = ggml_get_name(tensor);
 
-    auto it = loader->tensor_map.find(name);
-    if (it == loader->tensor_map.end()) {
-        // Distinguish two cases:
-        //   (a) Tensor IS in the GGUF but missing from the TWZM index – genuine bug.
-        //   (b) Tensor is NOT in the GGUF – it is either optional (correct zeros)
-        //       or weight-tied and handled by the architecture; silently skip.
+    const TwzmTensorEntry * entry = twzm_lookup(loader, name);
+    if (!entry) {
         if (loader->gguf_ctx &&
             gguf_find_tensor(loader->gguf_ctx, name) >= 0) {
             fprintf(stderr, "twzm: tensor '%s' is in GGUF metadata but missing "
                             "from TWZM index (conversion bug?)\n", name);
         } else {
-            TWZM_LOG("set_tensor_data: %-48s  SKIPPED (not in GGUF)", name);
+            TWZM_LOG_V("set_tensor_data: %-48s  SKIPPED (not in GGUF)", name);
         }
         return;
     }
 
-    const TwzmLoader::Region & region = it->second;
-
     size_t expected = ggml_nbytes(tensor);
-    TWZM_LOG("set_tensor_data: %-48s  type=%-8s  expected=%zu  have=%zu",
-             name, ggml_type_name(tensor->type), expected, region.len);
-    if (region.len < expected) {
-        fprintf(stderr, "twzm: tensor '%s': TWZM data %zu B < expected %zu B\n",
-                name, region.len, expected);
+    const uint8_t * src = loader->base + entry->data_offset;
+    TWZM_LOG_V("set_tensor_data: %-48s  type=%-8s  expected=%zu  have=%" PRIu64,
+             name, ggml_type_name(tensor->type), expected, entry->data_size);
+    if (entry->data_size < expected) {
+        fprintf(stderr, "twzm: tensor '%s': TWZM %" PRIu64 " B < expected %zu B\n",
+                name, entry->data_size, expected);
         return;
     }
-    // Use the backend API so the upload works for CPU, CUDA, Metal, etc.
-    ggml_backend_tensor_set(tensor, region.ptr, 0, expected);
+
+    // Zero-copy for CPU / no_alloc path: set tensor->data to point directly
+    // into the TWZM mapping.  This covers two cases:
+    //   (a) no_alloc=true: tensor->data is NULL (dummy zero-size buffer was used);
+    //       direct assignment is the only option.
+    //   (b) normal CPU allocation: tensor->data points into an anonymous mmap
+    //       that we no longer need; redirect it to the TWZM mapping instead.
+    // For device (GPU) tensors tensor->data is non-NULL device memory —
+    // upload via the backend copy API.
+    if (tensor->data == nullptr || (tensor->buffer && ggml_backend_buffer_is_host(tensor->buffer))) {
+        tensor->data = const_cast<uint8_t *>(src);
+    } else {
+        ggml_backend_tensor_set(tensor, src, 0, expected);
+    }
 
     // TWZM_DEBUG >= 2: dump raw bytes from the TWZM mapping so we can
     // verify the file content without relying on backend readback.
     if (twzm_debug_level() >= 2) {
         constexpr size_t PROBE = 16;
         size_t probe = expected < PROBE ? expected : PROBE;
-        const uint8_t * src = region.ptr;
         fprintf(stderr, "twzm:   twzm_bytes[0..%zu]: ", probe);
         for (size_t b = 0; b < probe; ++b) fprintf(stderr, "%02x", src[b]);
         // Also print from tensor->data directly (only safe for CPU buffers).
@@ -237,12 +241,43 @@ struct llama_model * llama_model_load_from_twzm(
         size_t size,
         struct llama_model_params params) {
 
+    auto twzm_ms = [](int64_t t0) -> double {
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        int64_t t1 = (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+        return (double)(t1 - t0);
+    };
+    auto twzm_now = []() -> int64_t {
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+    };
+    const bool do_time = twzm_debug_level() > 0;
+#define TWZM_STAGE(label)  do { if (do_time) { \
+    fprintf(stderr, "twzm: [time] %-40s %6.1f ms\n", (label), twzm_ms(t0_stage)); \
+    t0_stage = twzm_now(); } } while(0)
+
+    int64_t t0_stage = twzm_now();
+    int64_t t0_total = t0_stage;
+
+    // Fast path: the model was already built during a previous call in this
+    // process and its pointer was cached in the header via a COW write.
+    // On Twizzler this would be a persistent pointer surviving across processes.
+    TwzmHeader * hdr_rw = const_cast<TwzmHeader *>(
+        reinterpret_cast<const TwzmHeader *>(base));
+    if (hdr_rw->cached_model_ptr) {
+        TWZM_LOG("returning cached model from header pointer");
+        return reinterpret_cast<struct llama_model *>(
+            (uintptr_t)hdr_rw->cached_model_ptr);
+    }
+
     // 1. Open and validate the TWZM object.
     //    Pass gguf_ctx=nullptr for now; we'll set it after parsing.
     TwzmLoader loader;
     if (!loader.open(base, size, nullptr)) {
         return nullptr;
     }
+    TWZM_STAGE("open + validate index");
 
     // 2. Parse the embedded GGUF metadata blob.
     //    The blob contains all KV pairs and tensor info (name/type/shape) but
@@ -262,29 +297,21 @@ struct llama_model * llama_model_load_from_twzm(
         fprintf(stderr, "twzm: failed to parse embedded GGUF metadata blob\n");
         return nullptr;
     }
+    TWZM_STAGE("gguf_init_from_buffer");
 
     // Give the loader the context so it can classify missing tensors correctly.
     loader.gguf_ctx = gguf_ctx;
 
-    // 3. Handle weight tying: models like Llama 3.2 1B tie output.weight to
-    //    token_embd.weight.  When output.weight is absent from the GGUF the
-    //    llama.cpp files.empty() code path still creates an F32 tensor for it
-    //    (it doesn't return nullptr for TENSOR_NOT_REQUIRED the same way the
-    //    file-based path does), so weight tying is never triggered.  We fix
-    //    this by:
-    //      a) Adding output.weight to the TWZM tensor_map pointing at
-    //         token_embd.weight's data region (same bytes, same type).
-    //      b) Adding output.weight to the gguf_context so create_tensor picks
-    //         up the correct quantised type rather than defaulting to F32.
+    // 3. Handle weight tying: if output.weight is absent from the GGUF metadata
+    //    but IS present in the TWZM index (added by gguf_to_twzm), add a
+    //    synthetic gguf_context entry so create_tensor picks up the correct
+    //    quantised type rather than defaulting to F32.
     if (gguf_find_tensor(gguf_ctx, "output.weight") < 0) {
-        auto tok_it = loader.tensor_map.find("token_embd.weight");
+        const TwzmTensorEntry * out_entry = twzm_lookup(&loader, "output.weight");
         int64_t tok_id = gguf_find_tensor(gguf_ctx, "token_embd.weight");
-        if (tok_it != loader.tensor_map.end() && tok_id >= 0) {
-            // (a) TWZM alias
-            loader.tensor_map["output.weight"] = tok_it->second;
-            TWZM_LOG("weight tying: output.weight aliased to token_embd.weight");
+        if (out_entry && tok_id >= 0) {
+            TWZM_LOG("weight tying: output.weight aliased to token_embd.weight in gguf_ctx");
 
-            // (b) gguf_context synthetic entry so create_tensor sees the right type
             enum ggml_type type   = gguf_get_tensor_type(gguf_ctx, tok_id);
             const int64_t * ne    = gguf_get_tensor_ne(gguf_ctx, tok_id);
             int64_t blk           = (int64_t)ggml_blck_size(type);
@@ -304,16 +331,20 @@ struct llama_model * llama_model_load_from_twzm(
             gguf_add_tensor(gguf_ctx, &t);
         }
     }
+    TWZM_STAGE("weight tying");
 
     // 4. Build the llama_model via the existing user-init path.
-    //    llama_model_init_from_user() will call twzm_set_tensor_data for each
-    //    tensor, then free the gguf_context it received.
-    //    We disable mmap (we handle the mapping ourselves) and extra buffers.
-    params.use_mmap       = false;
+    params.use_mmap        = false;
     params.use_extra_bufts = false;
+    // NOTE: skip_vocab is NOT set here.  With it set, vocab.n_tokens()==0 and
+    // the arch builder creates tok_embd with n_vocab=0 which aborts.  The
+    // reserve() fix in load_vocab already cuts its cost to ~30ms; the flat
+    // section is kept for future Twizzler-native use where load_vocab can be
+    // bypassed at the OS level (persistent objects already have the vocab live).
 
     struct llama_model * model =
         llama_model_init_from_user(gguf_ctx, twzm_set_tensor_data, &loader, params);
+    TWZM_STAGE("llama_model_init_from_user");
 
     // 5. Free the gguf_context (model has its own copy of all metadata).
     // NOTE: set gguf_ctx pointer in loader to null before freeing so the
@@ -321,6 +352,14 @@ struct llama_model * llama_model_load_from_twzm(
     loader.gguf_ctx = nullptr;
     gguf_free(gguf_ctx);
 
+    if (do_time)
+        fprintf(stderr, "twzm: [time] %-40s %6.1f ms  (total)\n", "", twzm_ms(t0_total));
+
+    // Cache the model pointer in the header (MAP_PRIVATE COW write — file
+    // on disk is unchanged, pointer lives only in this process's page copy).
+    hdr_rw->cached_model_ptr = (uint64_t)(uintptr_t)model;
+
+#undef TWZM_STAGE
     return model;
 }
 
@@ -346,32 +385,43 @@ struct llama_model * llama_model_load_from_twzm(
 struct llama_model * llama_model_load_from_twzm_path(
         const char * path,
         struct llama_model_params params) {
-    int fd = open(path, O_RDONLY | O_CLOEXEC);
-    if (fd < 0) {
-        fprintf(stderr, "twzm: cannot open '%s': %s\n", path, strerror(errno));
-        return nullptr;
-    }
-    struct stat st;
-    if (fstat(fd, &st) < 0) {
-        fprintf(stderr, "twzm: fstat '%s' failed: %s\n", path, strerror(errno));
+    // Reuse the same mapping across calls for the same path so that the
+    // cached_model_ptr written into the header is visible on the next call.
+    static std::unordered_map<std::string, std::pair<void*, size_t>> s_mappings;
+    auto it = s_mappings.find(path);
+    void * base;
+    size_t sz;
+    if (it != s_mappings.end()) {
+        base = it->second.first;
+        sz   = it->second.second;
+    } else {
+        int fd = open(path, O_RDONLY | O_CLOEXEC);
+        if (fd < 0) {
+            fprintf(stderr, "twzm: cannot open '%s': %s\n", path, strerror(errno));
+            return nullptr;
+        }
+        struct stat st;
+        if (fstat(fd, &st) < 0) {
+            fprintf(stderr, "twzm: fstat '%s' failed: %s\n", path, strerror(errno));
+            close(fd);
+            return nullptr;
+        }
+        sz = (size_t)st.st_size;
+        // MAP_PRIVATE + PROT_WRITE: writes are copy-on-write (file never modified).
+        // Required so the COW cache write into the header doesn't segfault.
+        base = mmap(nullptr, sz, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
         close(fd);
-        return nullptr;
-    }
-    size_t sz = (size_t)st.st_size;
-    void * base = mmap(nullptr, sz, PROT_READ, MAP_PRIVATE, fd, 0);
-    close(fd);
-    if (base == MAP_FAILED) {
-        fprintf(stderr, "twzm: mmap '%s' failed: %s\n", path, strerror(errno));
-        return nullptr;
+        if (base == MAP_FAILED) {
+            fprintf(stderr, "twzm: mmap '%s' failed: %s\n", path, strerror(errno));
+            return nullptr;
+        }
+        s_mappings[path] = {base, sz};
     }
     struct llama_model * model = llama_model_load_from_twzm(base, sz, params);
     if (!model) {
+        s_mappings.erase(path);
         munmap(base, sz);
-        return nullptr;
     }
-    // The mapping must remain live for the model's lifetime.
-    // It is intentionally not unmapped here; it will be released on process exit.
-    // TODO: track {base,sz} keyed by model* and munmap from a llama_model_free wrapper.
     return model;
 }
 
