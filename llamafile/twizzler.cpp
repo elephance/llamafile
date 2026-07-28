@@ -52,6 +52,7 @@
 #include <cerrno>
 #include <stdexcept>
 #include <string>
+#include <vector>
 #include <unordered_map>
 
 // Set TWZM_DEBUG=1 in the environment to enable verbose tracing.
@@ -336,15 +337,48 @@ struct llama_model * llama_model_load_from_twzm(
     // 4. Build the llama_model via the existing user-init path.
     params.use_mmap        = false;
     params.use_extra_bufts = false;
-    // NOTE: skip_vocab is NOT set here.  With it set, vocab.n_tokens()==0 and
-    // the arch builder creates tok_embd with n_vocab=0 which aborts.  The
-    // reserve() fix in load_vocab already cuts its cost to ~30ms; the flat
-    // section is kept for future Twizzler-native use where load_vocab can be
-    // bypassed at the OS level (persistent objects already have the vocab live).
 
     struct llama_model * model =
         llama_model_init_from_user(gguf_ctx, twzm_set_tensor_data, &loader, params);
     TWZM_STAGE("llama_model_init_from_user");
+
+    // 4b. Replace token_to_id with the pre-built hash table if available.
+    //     load_vocab already built it the slow way (unordered_map inserts);
+    //     we swap in the hash-table-populated version for ~zero-cost lookups.
+    if (hdr->vocab_offset != 0 && hdr->vocab_size >= sizeof(TwzmVocabHeader)) {
+        const auto * vhdr = reinterpret_cast<const TwzmVocabHeader *>(
+            static_cast<const uint8_t *>(base) + hdr->vocab_offset);
+        if (vhdr->magic == TWZM_VOCAB_MAGIC &&
+            vhdr->token_hash_offset > 0 &&
+            vhdr->token_hash_capacity > 0) {
+            const char * text_pool = static_cast<const char *>(base) + hdr->vocab_offset +
+                sizeof(TwzmVocabHeader) +
+                vhdr->n_vocab * sizeof(TwzmTokenData) +
+                vhdr->n_merges * sizeof(uint32_t);
+            const void * hash_tbl = text_pool + vhdr->text_pool_size;
+
+            const struct llama_vocab * vocab = llama_model_get_vocab(model);
+            if (vocab) {
+                TWZM_LOG("vocab n_tokens before hash table: %d", llama_vocab_n_tokens(vocab));
+                llama_vocab_load_token_to_id_from_hash_table(
+                    vocab, hash_tbl, vhdr->token_hash_capacity, text_pool);
+                TWZM_LOG("replaced token_to_id from pre-built hash table "
+                         "(%" PRIu32 " entries, %" PRIu32 " capacity)",
+                         vhdr->token_hash_count, vhdr->token_hash_capacity);
+                TWZM_LOG("vocab n_tokens after hash table: %d", llama_vocab_n_tokens(vocab));
+                // Sanity check: tokenize a simple string and log result.
+                if (twzm_debug_level() > 0) {
+                    const char * test = "Hello";
+                    std::vector<llama_token> toks;
+                    toks.resize(16);
+                    int32_t n = llama_tokenize(vocab, test, strlen(test), toks.data(), toks.size(), false, false);
+                    fprintf(stderr, "twzm:   test tokenize '%s' -> %d tokens:", test, n);
+                    for (int32_t i = 0; i < n && i < 8; ++i) fprintf(stderr, " %d", toks[i]);
+                    fprintf(stderr, "\n");
+                }
+            }
+        }
+    }
 
     // 5. Free the gguf_context (model has its own copy of all metadata).
     // NOTE: set gguf_ctx pointer in loader to null before freeing so the
