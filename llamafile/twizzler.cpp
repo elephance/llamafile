@@ -17,19 +17,22 @@
 // Implements llama_model_load_from_twzm() and
 // llama_model_load_from_twizzler_object() by:
 //
-//   1. Validating the TWZM header.
+//   1. Validating the TWZM header of the (already-mapped) root object.
 //   2. Parsing the embedded GGUF metadata blob with gguf_init_from_buffer()
 //      (no tensor data allocation – just KV pairs + tensor type/shape info).
-//   3. Building a name→(base,size) index from the tensor index section.
-//   4. Calling llama_model_init_from_user() with a set_tensor_data callback
-//      that sets tensor->data to the pre-mapped address (zero-copy).
-//   5. Freeing the gguf_context (the model owns its own copy of all data).
+//   3. Building a name→(offset,size) index from the tensor index section.
+//   4. Mapping the tensor-data object (required) and, if present, the vocab
+//      object - both referenced from the root header via TwzmGlobalPtr.
+//   5. Calling llama_model_init_from_user() with a set_tensor_data callback
+//      that sets tensor->data to the pre-mapped tensor-data address
+//      (zero-copy), and the vocab mapping (if any) for fast vocab loading.
+//   6. Freeing the gguf_context (the model owns its own copy of all data).
 //
-// The caller that passes a pre-mapped region (llama_model_load_from_twzm)
-// remains responsible for keeping the mapping alive for the lifetime of the
-// returned model.  llama_model_load_from_twizzler_object() wraps the mapping
-// in a deleter stored in a helper object so the mapping is freed when the
-// model is freed.
+// The caller that passes a pre-mapped root region (llama_model_load_from_twzm)
+// remains responsible for keeping THAT mapping alive for the lifetime of the
+// returned model; the tensor-data and vocab mappings are owned internally by
+// this file and kept alive the same way (leaked for the model's lifetime -
+// see the NOTE above llama_model_load_from_twizzler_object() below).
 
 #include "twizzler.h"
 #include "twizzler_platform.h"
@@ -68,13 +71,24 @@ static int twzm_debug_level() {
 // The tensor index in the TWZM file is sorted by name at conversion time.
 // We keep a direct pointer into the mmap'd object and use bsearch().
 struct TwzmLoader {
-    const uint8_t         * base    = nullptr;
-    size_t                  size    = 0;
-    const TwzmTensorEntry * entries = nullptr; // pointer directly into mmap'd object
+    const uint8_t         * base    = nullptr; // root object base
+    size_t                  size    = 0;       // root object size
+    const TwzmTensorEntry * entries = nullptr; // pointer directly into mmap'd root object
     uint64_t                count   = 0;
     const gguf_context    * gguf_ctx = nullptr; // borrowed; used to classify missing tensors
 
+    // Set once the tensor-data object (a separate mapping - see
+    // TwzmHeader.tensor_data) has been mapped by the caller.
+    const uint8_t          * tensor_data_base = nullptr;
+    size_t                   tensor_data_size = 0;
+
     bool open(const void * base_ptr, size_t sz, const gguf_context * gguf);
+
+    // Validates every tensor index entry's data_offset/data_size against
+    // tensor_data_size. Must be called after tensor_data_base/size are set
+    // (separated from open() because the tensor-data object is mapped by
+    // the caller only after the root header has been parsed).
+    bool validate_tensor_bounds() const;
 };
 
 static int twzm_entry_cmp(const void * key, const void * elem) {
@@ -129,15 +143,13 @@ bool TwzmLoader::open(const void * base_ptr, size_t sz, const gguf_context * ggu
     entries = reinterpret_cast<const TwzmTensorEntry *>(base + hdr.tensor_index_offset);
     count   = hdr.tensor_count;
 
-    // Validate each entry and confirm the index is sorted (required for bsearch).
+    // Validate each entry's name and confirm the index is sorted (required
+    // for bsearch). data_offset/data_size are bounds-checked separately by
+    // validate_tensor_bounds() once the tensor-data object is mapped.
     for (uint64_t i = 0; i < count; ++i) {
         const TwzmTensorEntry & e = entries[i];
         if (strnlen(e.name, TWZM_TENSOR_NAME_MAX) == TWZM_TENSOR_NAME_MAX) {
             fprintf(stderr, "twzm: entry %" PRIu64 " name is not null-terminated\n", i);
-            return false;
-        }
-        if (e.data_offset + e.data_size > sz) {
-            fprintf(stderr, "twzm: tensor '%s' data out of bounds\n", e.name);
             return false;
         }
         if (i > 0 && strcmp(entries[i-1].name, e.name) >= 0) {
@@ -154,6 +166,19 @@ bool TwzmLoader::open(const void * base_ptr, size_t sz, const gguf_context * ggu
         }
     }
 
+    return true;
+}
+
+bool TwzmLoader::validate_tensor_bounds() const {
+    for (uint64_t i = 0; i < count; ++i) {
+        const TwzmTensorEntry & e = entries[i];
+        if (e.data_offset + e.data_size > tensor_data_size) {
+            fprintf(stderr, "twzm: tensor '%s' data out of bounds (offset=%" PRIu64
+                    " size=%" PRIu64 " > tensor-data object size %zu)\n",
+                    e.name, e.data_offset, e.data_size, tensor_data_size);
+            return false;
+        }
+    }
     return true;
 }
 
@@ -182,7 +207,7 @@ static void twzm_set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
     }
 
     size_t expected = ggml_nbytes(tensor);
-    const uint8_t * src = loader->base + entry->data_offset;
+    const uint8_t * src = loader->tensor_data_base + entry->data_offset;
     TWZM_LOG_V("set_tensor_data: %-48s  type=%-8s  expected=%zu  have=%" PRIu64,
              name, ggml_type_name(tensor->type), expected, entry->data_size);
     if (entry->data_size < expected) {
@@ -326,19 +351,85 @@ struct llama_model * llama_model_load_from_twzm(
     }
     TWZM_STAGE("weight tying");
 
-    // 4. Build the llama_model via the existing user-init path.
+    // 4. Map the tensor-data object (required - referenced from the root
+    //    header via TwzmHeader.tensor_data). Failure here is fatal: there is
+    //    no fallback path for tensor data the way there is for vocab.
+    if (hdr->tensor_data.id.hi == 0 && hdr->tensor_data.id.lo == 0) {
+        fprintf(stderr, "twzm: root object has no tensor-data reference\n");
+        gguf_free(gguf_ctx);
+        return nullptr;
+    }
+    size_t td_map_size = 0;
+    void * td_map_base = twz_object_map(hdr->tensor_data.id, &td_map_size);
+    if (!td_map_base) {
+        fprintf(stderr, "twzm: failed to map tensor-data object\n");
+        gguf_free(gguf_ctx);
+        return nullptr;
+    }
+    if (hdr->tensor_data.offset > td_map_size) {
+        fprintf(stderr, "twzm: tensor-data object reference offset out of bounds\n");
+        twz_object_unmap(td_map_base, td_map_size);
+        gguf_free(gguf_ctx);
+        return nullptr;
+    }
+    loader.tensor_data_base = static_cast<const uint8_t *>(td_map_base) + hdr->tensor_data.offset;
+    loader.tensor_data_size = td_map_size - hdr->tensor_data.offset;
+    if (!loader.validate_tensor_bounds()) {
+        twz_object_unmap(td_map_base, td_map_size);
+        gguf_free(gguf_ctx);
+        return nullptr;
+    }
+    TWZM_STAGE("map tensor-data object");
+
+    // 5. Map the vocab object, if the root references one. Unlike tensor
+    //    data, this is optional and non-fatal: the GGUF metadata blob always
+    //    carries full tokenizer KV data, so a missing/bad vocab object just
+    //    falls back to the normal (slower) vocab-construction path.
+    const void * twzm_vocab_section = nullptr;
+    void * vocab_map_base = nullptr;
+    size_t vocab_map_size = 0;
+    if (hdr->vocab.id.hi != 0 || hdr->vocab.id.lo != 0) {
+        vocab_map_base = twz_object_map(hdr->vocab.id, &vocab_map_size);
+        if (!vocab_map_base) {
+            fprintf(stderr, "twzm: warning: failed to map vocab object, "
+                            "falling back to normal vocab loading\n");
+        } else if (hdr->vocab.offset > vocab_map_size ||
+                   vocab_map_size - hdr->vocab.offset < sizeof(TwzmVocabHeader)) {
+            fprintf(stderr, "twzm: warning: vocab object too small, "
+                            "falling back to normal vocab loading\n");
+            twz_object_unmap(vocab_map_base, vocab_map_size);
+            vocab_map_base = nullptr;
+        } else {
+            const uint8_t * vsec = static_cast<const uint8_t *>(vocab_map_base) + hdr->vocab.offset;
+            uint32_t vmagic;
+            memcpy(&vmagic, vsec, sizeof(vmagic));
+            if (vmagic != TWZM_VOCAB_MAGIC) {
+                fprintf(stderr, "twzm: warning: vocab object bad magic 0x%08X, "
+                                "falling back to normal vocab loading\n", vmagic);
+                twz_object_unmap(vocab_map_base, vocab_map_size);
+                vocab_map_base = nullptr;
+            } else {
+                twzm_vocab_section = vsec;
+            }
+        }
+    }
+    TWZM_STAGE("map vocab object");
+
+    // 6. Build the llama_model via the existing user-init path.
     params.use_mmap        = false;
     params.use_extra_bufts = false;
-
-    // Determine the TWZM flat vocab section pointer (for fast vocab loading).
-    const void * twzm_vocab_section = nullptr;
-    if (hdr->vocab_offset != 0 && hdr->vocab_size >= 32) {
-        twzm_vocab_section = static_cast<const uint8_t *>(base) + hdr->vocab_offset;
-    }
 
     struct llama_model * model =
         llama_model_init_from_user(gguf_ctx, twzm_set_tensor_data, &loader, params, twzm_vocab_section);
     TWZM_STAGE("llama_model_init_from_user");
+
+    if (!model) {
+        fprintf(stderr, "twzm: llama_model_init_from_user failed\n");
+        twz_object_unmap(td_map_base, td_map_size);
+        if (vocab_map_base) twz_object_unmap(vocab_map_base, vocab_map_size);
+        gguf_free(gguf_ctx);
+        return nullptr;
+    }
 
     // Note: the TWZM hash-table wiring (pointing token_to_id lookups directly
     // at the mmap'd on-disk hash table when present) now happens inside
@@ -357,7 +448,7 @@ struct llama_model * llama_model_load_from_twzm(
         }
     }
 
-    // 5. Free the gguf_context (model has its own copy of all metadata).
+    // 7. Free the gguf_context (model has its own copy of all metadata).
     // NOTE: set gguf_ctx pointer in loader to null before freeing so the
     // callback (which may still run during model cleanup) doesn't dereference it.
     loader.gguf_ctx = nullptr;
@@ -378,20 +469,17 @@ struct llama_model * llama_model_load_from_twzm(
 // llama_model_load_from_twizzler_object
 // ---------------------------------------------------------------------------
 
-// Helper that pairs a mapping with a model so the mapping can be freed when
-// the model is freed.  We use a side-channel via a global registry rather
-// than modifying llama_model internals.
-//
 // NOTE: llama.cpp does not expose a model-destruction hook, so we cannot
-// automatically unmap when llama_model_free() is called.  Instead we
-// document that callers must call twz_object_unmap() with the values
-// returned from twz_object_map() after freeing the model, or use the
-// lower-level llama_model_load_from_twzm() with an externally managed
-// mapping lifetime.
-//
-// For convenience, llama_model_load_from_twizzler_object() still maps the
-// object and returns both the model and—via the out parameters when non-
-// NULL—the mapping handle so the caller can unmap it.
+// automatically unmap when llama_model_free() is called. This applies to
+// all THREE mappings a loaded model depends on: the root object mapped
+// here, plus the tensor-data object and (if present) the vocab object
+// mapped internally by llama_model_load_from_twzm(). All three are simply
+// kept alive for the remainder of the process (reclaimed on exit) - there
+// is currently no supported way to unmap a fully-loaded model's mappings
+// short of process exit. Callers needing explicit lifetime control should
+// use the lower-level llama_model_load_from_twzm() with an externally
+// managed root mapping (the tensor-data/vocab mappings are still owned
+// internally either way).
 
 struct llama_model * llama_model_load_from_twzm_path(
         const char * path,

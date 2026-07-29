@@ -16,18 +16,25 @@
 //
 // Usage: gguf-to-twzm <input.gguf> <output.twzm>
 //
-// The TWZM file can then be loaded with llama_model_load_from_twizzler_object()
-// (after placing it in $TWZ_OBJECT_PATH under the name <hi>_<lo>.twzm) or
-// directly with llama_model_load_from_twzm().
+// Writes THREE Twizzler objects:
+//   - Root/metadata object, at <output.twzm> (header + tensor index + GGUF
+//     metadata blob).
+//   - Tensor-data object, at a freshly generated 128-bit id under
+//     $TWZ_OBJECT_PATH (all raw tensor bytes, page-aligned).
+//   - Vocab object, at another freshly generated id under $TWZ_OBJECT_PATH
+//     (flat vocab section - tokens, hash tables, merges, piece cache).
+// The root object refers to the other two via a TwzmGlobalPtr (id + offset)
+// embedded in its header. Loading the root (by path or by its own id) later
+// requires $TWZ_OBJECT_PATH to be set to the same directory used here, so
+// the embedded references can be resolved.
 //
-// Output file layout:
+// Root object layout:
 //
-//   [  0 ]  TwzmHeader (64 bytes)
-//   [ 64 ]  Tensor index: tensor_count × TwzmTensorEntry (128 bytes each)
+//   [  0 ]  TwzmHeader (96 bytes)
+//   [ 96 ]  Tensor index: tensor_count × TwzmTensorEntry (112 bytes each)
 //   [  A ]  GGUF metadata blob (bytes [0, data_offset) of the original GGUF)
-//   [  B ]  Tensor data regions (each page-aligned to TWZM_DATA_ALIGNMENT)
 //
-// where A = 64 + tensor_count×128 and B = ALIGN(A + metadata_size, PAGE).
+// where A = 96 + tensor_count×112.
 
 #include "twizzler.h"
 #include "twizzler_platform.h"
@@ -109,8 +116,8 @@ int main(int argc, char ** argv) {
     const char * in_path  = argv[1];
     const char * out_path = argv[2];
 
-    // Needed later (step 8) for a vocab_only model load, used to precompute
-    // the token-to-piece cache. Cheap in this build (CPU-only, statically
+    // Needed later for a vocab_only model load, used to precompute the
+    // token-to-piece cache. Cheap in this build (CPU-only, statically
     // linked backend - no dlopen/directory scan).
     llama_backend_init();
 
@@ -167,7 +174,10 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "  metadata blob:   %" PRIu64 " bytes\n", gguf_data_offset);
 
     // -----------------------------------------------------------------------
-    // 2. Compute the TWZM file layout.
+    // 2. Compute layouts. The root object holds header + tensor index +
+    //    metadata blob only; tensor data and vocab each live in their own
+    //    dedicated object (see top-of-file comment), so their layouts are
+    //    computed independently, each starting at offset 0.
     // -----------------------------------------------------------------------
     const uint64_t header_size       = (uint64_t)sizeof(TwzmHeader);
     const uint64_t entry_size        = (uint64_t)sizeof(TwzmTensorEntry);
@@ -175,9 +185,10 @@ int main(int argc, char ** argv) {
     const uint64_t tensor_index_size = (uint64_t)n_entries * entry_size;
     const uint64_t metadata_off      = tensor_index_off + tensor_index_size;
     const uint64_t metadata_size     = gguf_data_offset;
+    const uint64_t root_total_size   = metadata_off + metadata_size;
 
-    // First tensor data starts at the next page boundary after the metadata.
-    uint64_t next_data_off = align_up(metadata_off + metadata_size, TWZM_DATA_ALIGNMENT);
+    // Tensor-data object layout: page-aligned regions starting at offset 0.
+    uint64_t next_data_off = 0;
 
     // Build the tensor index in GGUF tensor order first, then sort by name.
     // We also save per-tensor data offsets before sorting so the write phase
@@ -224,13 +235,14 @@ int main(int argc, char ** argv) {
                   return strcmp(a.name, b.name) < 0;
               });
 
-    uint64_t total_file_size = next_data_off;
+    const uint64_t tensor_data_total_size = next_data_off;
 
     fprintf(stderr, "  tensor data:     %" PRIu64 " bytes\n", total_tensor_bytes);
-    fprintf(stderr, "  output size:     %" PRIu64 " bytes\n", total_file_size);
+    fprintf(stderr, "  root object:     %" PRIu64 " bytes\n", root_total_size);
+    fprintf(stderr, "  tensor-data obj: %" PRIu64 " bytes\n", tensor_data_total_size);
 
     // -----------------------------------------------------------------------
-    // 3. Open input GGUF as raw bytes and create the output object.
+    // 3. Open input GGUF as raw bytes.
     // -----------------------------------------------------------------------
     FILE * fin = fopen(in_path, "rb");
     if (!fin) {
@@ -239,59 +251,35 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    // twz_object_create_at_path() creates+truncates the file to
-    // total_file_size (zero-filled) and maps it read-write, so there is no
-    // separate "extend to the last page boundary" step needed afterwards.
-    uint8_t * obj = static_cast<uint8_t *>(twz_object_create_at_path(out_path, total_file_size));
-    if (!obj) {
-        fprintf(stderr, "gguf-to-twzm: cannot create '%s'\n", out_path);
+    // -----------------------------------------------------------------------
+    // 4. Create the tensor-data object and write all tensor bytes into it.
+    //    Created before the root, since the root header embeds this
+    //    object's freshly generated id.
+    // -----------------------------------------------------------------------
+    twz_objid tensor_data_id{};
+    uint8_t * td_obj = static_cast<uint8_t *>(
+        twz_object_create_fresh(&tensor_data_id, tensor_data_total_size));
+    if (!td_obj) {
+        fprintf(stderr, "gguf-to-twzm: cannot create tensor-data object\n");
         fclose(fin);
         gguf_free(gguf_ctx);
         return 1;
     }
 
-    // -----------------------------------------------------------------------
-    // 4. Write TwzmHeader.
-    // -----------------------------------------------------------------------
-    {
-        TwzmHeader hdr = {};
-        hdr.magic               = TWZM_MAGIC;
-        hdr.version             = TWZM_VERSION;
-        hdr.metadata_offset     = metadata_off;
-        hdr.metadata_size       = metadata_size;
-        hdr.tensor_index_offset = tensor_index_off;
-        hdr.tensor_count        = (uint64_t)n_entries; // sorted; includes aliases
-        memcpy(obj, &hdr, sizeof(hdr));
-    }
-
-    // -----------------------------------------------------------------------
-    // 5. Write sorted tensor index.
-    // -----------------------------------------------------------------------
-    memcpy(obj + tensor_index_off, index.data(), (size_t)tensor_index_size);
-
-    // -----------------------------------------------------------------------
-    // 6. Write GGUF metadata blob (bytes [0, gguf_data_offset) of input file).
-    // -----------------------------------------------------------------------
-    if (!copy_bytes(obj, metadata_off, fin, 0, metadata_size)) {
-        fprintf(stderr, "gguf-to-twzm: failed to copy GGUF metadata blob\n");
-        goto fail;
-    }
-
-    // -----------------------------------------------------------------------
-    // 7. Write tensor data regions at page-aligned offsets.
-    //    Use the saved per-tensor offsets (pre-sort) so we know where each
-    //    GGUF tensor was assigned regardless of the sorted index order.
-    // -----------------------------------------------------------------------
     for (int64_t i = 0; i < n_tensors; ++i) {
         // gguf_get_tensor_offset() returns the offset of tensor i within the
         // GGUF data section (i.e. relative to gguf_data_offset, not file start).
         uint64_t in_offset = gguf_data_offset + (uint64_t)gguf_get_tensor_offset(gguf_ctx, i);
         uint64_t in_size   = (uint64_t)gguf_get_tensor_size(gguf_ctx, i);
 
-        if (!copy_bytes(obj, gguf_tensor_data_off[i], fin, in_offset, in_size)) {
+        if (!copy_bytes(td_obj, gguf_tensor_data_off[i], fin, in_offset, in_size)) {
             fprintf(stderr, "gguf-to-twzm: failed to copy tensor '%s'\n",
                     gguf_get_tensor_name(gguf_ctx, i));
-            goto fail;
+            twz_object_finalize(td_obj, tensor_data_total_size);
+            twz_object_destroy(tensor_data_id);
+            fclose(fin);
+            gguf_free(gguf_ctx);
+            return 1;
         }
 
         if ((i + 1) % 100 == 0 || i == n_tensors - 1) {
@@ -300,14 +288,17 @@ int main(int argc, char ** argv) {
     }
     fprintf(stderr, "\n");
 
-    fclose(fin);
-    fin = nullptr;
-    gguf_free(gguf_ctx);
-    fprintf(stderr, "gguf-to-twzm: wrote '%s'\n", out_path);
+    twz_object_finalize(td_obj, tensor_data_total_size);
+    fprintf(stderr, "gguf-to-twzm: tensor-data object: %016" PRIx64 "_%016" PRIx64 "\n",
+            tensor_data_id.hi, tensor_data_id.lo);
 
     // -----------------------------------------------------------------------
-    // 8. Append flat vocab section and update the header.
+    // 5. Build the flat vocab section and write it to its own object.
+    //    Unlike the old single-object format, the object is created at its
+    //    final size directly (vsize is fully known before any bytes are
+    //    written) - no grow-after-the-fact step needed.
     // -----------------------------------------------------------------------
+    twz_objid vocab_id{}; // stays {0,0} (absent) if no vocab object is created
     {
         // Re-open gguf_ctx to read token data.
         struct gguf_context * vctx = gguf_init_from_file(in_path, gguf_params);
@@ -497,11 +488,6 @@ int main(int argc, char ** argv) {
                     piece_data_offset, piece_pool_offset, (uint32_t)piece_pool.size(),
                     max_token_len};
 
-            // Grow the object to append the vocab section after the current
-            // end (voff == total_file_size, the tensor-data region written
-            // above). vsize is computed directly from the pieces below
-            // rather than inferred from a file cursor.
-            const uint64_t voff = total_file_size;
             const uint64_t vsize =
                 sizeof(fh) +
                 sizeof(TokEntry) * nv +
@@ -512,57 +498,103 @@ int main(int argc, char ** argv) {
                 piece_entries.size() * sizeof(TwzmPieceEntry) +
                 piece_pool.size();
 
-            uint8_t * resized = static_cast<uint8_t *>(
-                twz_object_resize(obj, total_file_size, voff + vsize));
-            if (!resized) {
-                fprintf(stderr, "gguf-to-twzm: failed to grow object for vocab section\n");
-                twz_object_finalize(obj, total_file_size);
-                remove(out_path);
+            uint8_t * vocab_obj = static_cast<uint8_t *>(twz_object_create_fresh(&vocab_id, vsize));
+            if (!vocab_obj) {
+                fprintf(stderr, "gguf-to-twzm: failed to create vocab object\n");
+                twz_object_destroy(tensor_data_id);
                 gguf_free(vctx);
+                fclose(fin);
+                gguf_free(gguf_ctx);
                 return 1;
             }
-            obj = resized;
-            total_file_size = voff + vsize;
 
             // Write: header, token data, merge offsets, text pool, token
             // hash table, merge hash table, piece data, piece pool.
-            uint64_t w = voff;
-            memcpy(obj + w, &fh, sizeof(fh));                          w += sizeof(fh);
-            memcpy(obj + w, td.data(), sizeof(TokEntry) * nv);         w += sizeof(TokEntry) * nv;
-            memcpy(obj + w, merge_offsets.data(), sizeof(uint32_t) * nm); w += sizeof(uint32_t) * nm;
-            memcpy(obj + w, pool.data(), pool.size());                 w += pool.size();
+            uint64_t w = 0;
+            memcpy(vocab_obj + w, &fh, sizeof(fh));                          w += sizeof(fh);
+            memcpy(vocab_obj + w, td.data(), sizeof(TokEntry) * nv);         w += sizeof(TokEntry) * nv;
+            memcpy(vocab_obj + w, merge_offsets.data(), sizeof(uint32_t) * nm); w += sizeof(uint32_t) * nm;
+            memcpy(vocab_obj + w, pool.data(), pool.size());                 w += pool.size();
             if (!hash_tbl.empty()) {
-                memcpy(obj + w, hash_tbl.data(), hash_tbl.size() * sizeof(HashEntry));
+                memcpy(vocab_obj + w, hash_tbl.data(), hash_tbl.size() * sizeof(HashEntry));
                 w += hash_tbl.size() * sizeof(HashEntry);
             }
             if (!merge_hash_tbl.empty()) {
-                memcpy(obj + w, merge_hash_tbl.data(), merge_hash_tbl.size() * sizeof(HashEntry));
+                memcpy(vocab_obj + w, merge_hash_tbl.data(), merge_hash_tbl.size() * sizeof(HashEntry));
                 w += merge_hash_tbl.size() * sizeof(HashEntry);
             }
             if (!piece_entries.empty()) {
-                memcpy(obj + w, piece_entries.data(), piece_entries.size() * sizeof(TwzmPieceEntry));
+                memcpy(vocab_obj + w, piece_entries.data(), piece_entries.size() * sizeof(TwzmPieceEntry));
                 w += piece_entries.size() * sizeof(TwzmPieceEntry);
-                memcpy(obj + w, piece_pool.data(), piece_pool.size());
+                memcpy(vocab_obj + w, piece_pool.data(), piece_pool.size());
                 w += piece_pool.size();
             }
 
-            // Patch vocab_offset + vocab_size directly into the header.
-            reinterpret_cast<TwzmHeader *>(obj)->vocab_offset = voff;
-            reinterpret_cast<TwzmHeader *>(obj)->vocab_size   = vsize;
-
+            twz_object_finalize(vocab_obj, vsize);
+            fprintf(stderr, "gguf-to-twzm: vocab object: %016" PRIx64 "_%016" PRIx64 "\n",
+                    vocab_id.hi, vocab_id.lo);
             fprintf(stderr, "gguf-to-twzm: vocab section: %u tokens, %u merges, "
                     "token hash %u/%u slots, merge hash %u/%u slots, "
                     "piece cache %s, %" PRIu64 " bytes\n",
                     nv, nm, nv, hash_cap, nm, merge_hash_cap,
                     piece_entries.empty() ? "absent" : "precomputed", vsize);
+        } else {
+            fprintf(stderr, "gguf-to-twzm: warning: could not re-parse GGUF for vocab section, "
+                    "vocab object will be absent (slower load-time vocab construction)\n");
         }
         if (vctx) gguf_free(vctx);
     }
 
-    twz_object_finalize(obj, total_file_size);
+    // -----------------------------------------------------------------------
+    // 6. Create the root object and write header + tensor index + metadata.
+    //    Written last, since the header embeds the tensor-data/vocab ids
+    //    generated above.
+    // -----------------------------------------------------------------------
+    uint8_t * obj = static_cast<uint8_t *>(twz_object_create_at_path(out_path, root_total_size));
+    if (!obj) {
+        fprintf(stderr, "gguf-to-twzm: cannot create '%s'\n", out_path);
+        twz_object_destroy(tensor_data_id);
+        if (vocab_id.hi || vocab_id.lo) twz_object_destroy(vocab_id);
+        fclose(fin);
+        gguf_free(gguf_ctx);
+        return 1;
+    }
+
+    {
+        TwzmHeader hdr = {};
+        hdr.magic               = TWZM_MAGIC;
+        hdr.version             = TWZM_VERSION;
+        hdr.metadata_offset     = metadata_off;
+        hdr.metadata_size       = metadata_size;
+        hdr.tensor_index_offset = tensor_index_off;
+        hdr.tensor_count        = (uint64_t)n_entries; // sorted; includes aliases
+        hdr.tensor_data         = TwzmGlobalPtr{tensor_data_id, 0}; // required
+        hdr.vocab               = TwzmGlobalPtr{vocab_id, 0};       // {0,0} id = absent
+        memcpy(obj, &hdr, sizeof(hdr));
+    }
+
+    memcpy(obj + tensor_index_off, index.data(), (size_t)tensor_index_size);
+
+    if (!copy_bytes(obj, metadata_off, fin, 0, metadata_size)) {
+        fprintf(stderr, "gguf-to-twzm: failed to copy GGUF metadata blob\n");
+        twz_object_finalize(obj, root_total_size);
+        remove(out_path);
+        twz_object_destroy(tensor_data_id);
+        if (vocab_id.hi || vocab_id.lo) twz_object_destroy(vocab_id);
+        fclose(fin);
+        gguf_free(gguf_ctx);
+        return 1;
+    }
+
+    twz_object_finalize(obj, root_total_size);
+    fclose(fin);
+    gguf_free(gguf_ctx);
+    fprintf(stderr, "gguf-to-twzm: wrote root object '%s'\n", out_path);
+    fprintf(stderr, "gguf-to-twzm: note: $TWZ_OBJECT_PATH must be set consistently "
+            "(same value used here) when loading this model later\n");
 
     // -----------------------------------------------------------------------
-    // 8. Optional verification: re-open both files and spot-check each tensor.
+    // 7. Optional verification: re-map all objects and spot-check each tensor.
     // -----------------------------------------------------------------------
     if (verify) {
         fprintf(stderr, "gguf-to-twzm: verifying ...\n");
@@ -576,10 +608,11 @@ int main(int argc, char ** argv) {
             return 1;
         }
 
+        TwzmHeader whdr;
+        memcpy(&whdr, dst_map, sizeof(whdr));
+
         // 1. Header sanity
         {
-            TwzmHeader whdr;
-            memcpy(&whdr, dst_map, sizeof(whdr));
             if (whdr.magic != TWZM_MAGIC)
                 fprintf(stderr, "gguf-to-twzm: verify: wrong magic\n"), mismatches++;
             if (whdr.version != TWZM_VERSION)
@@ -599,10 +632,21 @@ int main(int argc, char ** argv) {
                         "(%" PRIu64 " tensors)\n", whdr.tensor_count);
         }
 
+        // 2. Map the tensor-data object and spot-check each tensor.
+        size_t td_size = 0;
+        const uint8_t * td_map = static_cast<const uint8_t *>(
+            twz_object_map(whdr.tensor_data.id, &td_size));
+        if (!td_map) {
+            fprintf(stderr, "gguf-to-twzm: verify: cannot map tensor-data object\n");
+            twz_object_unmap(const_cast<uint8_t *>(dst_map), dst_size);
+            return 1;
+        }
+
         // Re-open the GGUF to get tensor data offsets.
         struct gguf_context * vctx = gguf_init_from_file(in_path, gguf_params);
         if (!vctx) {
             fprintf(stderr, "gguf-to-twzm: verify: cannot re-parse GGUF\n");
+            twz_object_unmap(const_cast<uint8_t *>(td_map), td_size);
             twz_object_unmap(const_cast<uint8_t *>(dst_map), dst_size);
             return 1;
         }
@@ -612,6 +656,7 @@ int main(int argc, char ** argv) {
         if (!fsrc) {
             fprintf(stderr, "gguf-to-twzm: verify: cannot re-open '%s'\n", in_path);
             gguf_free(vctx);
+            twz_object_unmap(const_cast<uint8_t *>(td_map), td_size);
             twz_object_unmap(const_cast<uint8_t *>(dst_map), dst_size);
             return 1;
         }
@@ -645,18 +690,18 @@ int main(int argc, char ** argv) {
                 mismatches++;
                 continue;
             }
-            if (dst_off + probe > dst_size) {
-                fprintf(stderr, "gguf-to-twzm: verify: TWZM offset out of bounds for '%s'\n", name);
+            if (dst_off + probe > td_size) {
+                fprintf(stderr, "gguf-to-twzm: verify: tensor-data offset out of bounds for '%s'\n", name);
                 mismatches++;
                 continue;
             }
-            if (memcmp(src_buf.data(), dst_map + dst_off, probe) != 0) {
+            if (memcmp(src_buf.data(), td_map + dst_off, probe) != 0) {
                 fprintf(stderr, "gguf-to-twzm: verify: MISMATCH for '%s' at GGUF off=%" PRIu64 " TWZM off=%" PRIu64 "\n",
                         name, src_off, dst_off);
                 fprintf(stderr, "  gguf: ");
                 for (size_t b = 0; b < probe; ++b) fprintf(stderr, "%02x", src_buf[b]);
                 fprintf(stderr, "\n  twzm: ");
-                for (size_t b = 0; b < probe; ++b) fprintf(stderr, "%02x", dst_map[dst_off + b]);
+                for (size_t b = 0; b < probe; ++b) fprintf(stderr, "%02x", td_map[dst_off + b]);
                 fprintf(stderr, "\n");
                 mismatches++;
             }
@@ -664,22 +709,40 @@ int main(int argc, char ** argv) {
 
         fclose(fsrc);
         gguf_free(vctx);
+        twz_object_unmap(const_cast<uint8_t *>(td_map), td_size);
+
+        // 3. Map the vocab object (if present) and sanity-check it.
+        if (whdr.vocab.id.hi != 0 || whdr.vocab.id.lo != 0) {
+            size_t v_size = 0;
+            const uint8_t * v_map = static_cast<const uint8_t *>(
+                twz_object_map(whdr.vocab.id, &v_size));
+            if (!v_map) {
+                fprintf(stderr, "gguf-to-twzm: verify: cannot map vocab object\n");
+                mismatches++;
+            } else {
+                uint32_t vmagic = 0;
+                if (whdr.vocab.offset + sizeof(vmagic) <= v_size) {
+                    memcpy(&vmagic, v_map + whdr.vocab.offset, sizeof(vmagic));
+                }
+                if (vmagic != TWZM_VOCAB_MAGIC) {
+                    fprintf(stderr, "gguf-to-twzm: verify: vocab object bad magic 0x%08X\n", vmagic);
+                    mismatches++;
+                } else {
+                    fprintf(stderr, "gguf-to-twzm: verify: vocab object OK\n");
+                }
+                twz_object_unmap(const_cast<uint8_t *>(v_map), v_size);
+            }
+        }
+
         twz_object_unmap(const_cast<uint8_t *>(dst_map), dst_size);
 
         if (mismatches == 0) {
             fprintf(stderr, "gguf-to-twzm: verify: all %" PRId64 " tensors OK\n", n_tensors);
         } else {
-            fprintf(stderr, "gguf-to-twzm: verify: %d tensor(s) FAILED\n", mismatches);
+            fprintf(stderr, "gguf-to-twzm: verify: %d issue(s) FAILED\n", mismatches);
             return 1;
         }
     }
 
     return 0;
-
-fail:
-    if (fin) fclose(fin);
-    twz_object_finalize(obj, total_file_size);
-    remove(out_path);
-    gguf_free(gguf_ctx);
-    return 1;
 }

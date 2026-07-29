@@ -36,6 +36,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/random.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <string>
@@ -51,6 +52,18 @@ static int twz_object_path(twz_objid id, char * buf, size_t buf_size) {
     int n = snprintf(buf, buf_size, "%s/%016" PRIx64 "_%016" PRIx64 ".twzm",
                      base, id.hi, id.lo);
     return n > 0 && (size_t)n < buf_size;
+}
+
+// Ensure the TWZ_OBJECT_PATH directory (or its "./twzm_objects" default)
+// exists, for objid-resolved writes (twz_object_create()/create_fresh()).
+// Best-effort: mkdir failures other than "already exists" are left to
+// surface naturally from the open() call that follows.
+static void twz_ensure_object_dir(void) {
+    const char * base = getenv("TWZ_OBJECT_PATH");
+    if (!base || base[0] == '\0') {
+        base = "./twzm_objects";
+    }
+    mkdir(base, 0755);
 }
 
 // ---------------------------------------------------------------------------
@@ -156,20 +169,11 @@ void twz_object_unmap(void * base, size_t size) {
 struct TwzmWritableMapping { int fd; size_t size; };
 static std::unordered_map<void *, TwzmWritableMapping> g_writable_mappings;
 
-void * twz_object_create_at_path(const char * path, size_t size) {
-    if (size == 0) {
-        fprintf(stderr, "twz_object_create: cannot create a zero-size object ('%s')\n", path);
-        return NULL;
-    }
-
-    int fd = open(path, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
-    if (fd < 0) {
-        fprintf(stderr, "twz_object_create: cannot create '%s': %s\n",
-                path, strerror(errno));
-        return NULL;
-    }
-
-    // Zero-fills the file up to `size` (sparse on most filesystems).
+// Shared tail for twz_object_create_at_path()/twz_object_create_fresh():
+// zero-fill `fd` to `size` via ftruncate, mmap it MAP_SHARED/PROT_WRITE, and
+// register it in g_writable_mappings. On failure, closes `fd` and returns
+// NULL (caller is responsible for unlink()ing the path it opened, if any).
+static void * map_new_object(int fd, const char * path, size_t size) {
     if (ftruncate(fd, (off_t)size) != 0) {
         fprintf(stderr, "twz_object_create: ftruncate '%s' to %zu bytes failed: %s\n",
                 path, size, strerror(errno));
@@ -191,6 +195,26 @@ void * twz_object_create_at_path(const char * path, size_t size) {
     return ptr;
 }
 
+void * twz_object_create_at_path(const char * path, size_t size) {
+    if (size == 0) {
+        fprintf(stderr, "twz_object_create: cannot create a zero-size object ('%s')\n", path);
+        return NULL;
+    }
+
+    int fd = open(path, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0) {
+        fprintf(stderr, "twz_object_create: cannot create '%s': %s\n",
+                path, strerror(errno));
+        return NULL;
+    }
+
+    void * ptr = map_new_object(fd, path, size);
+    if (!ptr) {
+        unlink(path);
+    }
+    return ptr;
+}
+
 void * twz_object_create(twz_objid id, size_t size) {
     char path[4096];
     if (!twz_object_path(id, path, sizeof(path))) {
@@ -199,7 +223,82 @@ void * twz_object_create(twz_objid id, size_t size) {
         return NULL;
     }
 
+    twz_ensure_object_dir();
     return twz_object_create_at_path(path, size);
+}
+
+// Draw 128 random bits via getrandom(). Returns false (retryable) on a
+// short read or an all-zero draw (reserved as the "absent" sentinel in the
+// TWZM format's TwzmGlobalPtr).
+static bool twz_random_objid(twz_objid * id) {
+    unsigned char buf[16];
+    ssize_t got = getrandom(buf, sizeof(buf), 0);
+    if (got != (ssize_t)sizeof(buf)) {
+        return false;
+    }
+    memcpy(&id->hi, buf, 8);
+    memcpy(&id->lo, buf + 8, 8);
+    return id->hi != 0 || id->lo != 0;
+}
+
+void * twz_object_create_fresh(twz_objid * out_id, size_t size) {
+    *out_id = twz_objid{0, 0};
+
+    if (size == 0) {
+        fprintf(stderr, "twz_object_create_fresh: cannot create a zero-size object\n");
+        return NULL;
+    }
+
+    twz_ensure_object_dir();
+
+    for (int attempt = 0; attempt < 64; ++attempt) {
+        twz_objid id;
+        if (!twz_random_objid(&id)) {
+            continue;
+        }
+
+        char path[4096];
+        if (!twz_object_path(id, path, sizeof(path))) {
+            fprintf(stderr, "twz_object_create_fresh: generated path too long\n");
+            return NULL;
+        }
+
+        // O_EXCL: an existing file at this (astronomically unlikely) path
+        // means an id collision - retry with a freshly drawn id rather than
+        // clobbering whatever is there.
+        int fd = open(path, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+        if (fd < 0) {
+            if (errno == EEXIST) {
+                continue;
+            }
+            fprintf(stderr, "twz_object_create_fresh: cannot create '%s': %s\n",
+                    path, strerror(errno));
+            return NULL;
+        }
+
+        void * ptr = map_new_object(fd, path, size);
+        if (!ptr) {
+            unlink(path);
+            return NULL;
+        }
+
+        *out_id = id;
+        return ptr;
+    }
+
+    fprintf(stderr, "twz_object_create_fresh: exhausted retries generating a fresh objid\n");
+    return NULL;
+}
+
+void twz_object_destroy(twz_objid id) {
+    char path[4096];
+    if (!twz_object_path(id, path, sizeof(path))) {
+        return;
+    }
+    if (unlink(path) != 0 && errno != ENOENT) {
+        fprintf(stderr, "twz_object_destroy: unlink '%s' failed: %s\n",
+                path, strerror(errno));
+    }
 }
 
 void * twz_object_resize(void * base, size_t old_size, size_t new_size) {

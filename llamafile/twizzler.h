@@ -14,24 +14,41 @@
 
 // Twizzler Memory Object loader for llama.cpp models.
 //
-// The TWZM (Twizzler Model) format is a self-contained binary object that
-// stores a llama.cpp model and can be directly memory-mapped.  The format
-// embeds:
-//   - A fixed 64-byte header (magic, version, field offsets).
-//   - A tensor index (name → in-object offset lookup table).
-//   - A GGUF metadata blob (all KV pairs + tensor info headers, no data).
-//   - Page-aligned tensor data regions (zero-copy mappable).
+// The TWZM (Twizzler Model) format stores a llama.cpp model across THREE
+// Twizzler objects, each directly memory-mappable:
+//   - Root/metadata object: a fixed header (magic, version, field offsets),
+//     a tensor index (name → in-tensor-data-object offset lookup table),
+//     and a GGUF metadata blob (all KV pairs + tensor info headers, no data).
+//   - Vocab object (optional): the flat vocab section (tokens, hash tables,
+//     merges, detokenize piece cache) - see TwzmVocabHeader below.
+//   - Tensor-data object: all raw tensor bytes, at page-aligned offsets
+//     (zero-copy mappable).
 //
-// On Twizzler OS the object is identified by a 128-bit ObjID and mapped
+// The root object refers to the other two via a TwzmGlobalPtr - a 128-bit
+// Twizzler object id plus a byte offset within that object - embedded in
+// TwzmHeader. Callers address the root directly (by id or, on the Linux dev
+// shim, by file path); everything else is reached by following the
+// pointers embedded in it, same as a real Twizzler-OS deployment would
+// resolve them.
+//
+// On Twizzler OS each object is identified by a 128-bit ObjID and mapped
 // via native Twizzler syscalls.  On Linux a file-backed shim is provided
-// for development and testing (see TWZ_OBJECT_PATH).
+// for development and testing - see TWZ_OBJECT_PATH (twizzler_platform.h).
+// Note that loading the root by direct file path (llama_model_load_from_twzm_path)
+// still requires TWZ_OBJECT_PATH to be set consistently with conversion
+// time, since the root's embedded pointers are always resolved by id.
 //
 // Loading flow:
-//   1. twz_object_map()         – map the object into address space.
+//   1. twz_object_map()/twz_object_map_at_path() – map the root object.
 //   2. gguf_init_from_buffer()  – parse embedded GGUF metadata blob.
-//   3. llama_model_init_from_user() – build llama_model from metadata +
-//        set_tensor_data_cb that sets tensor->data pointers into the map.
-//   4. twz_object_unmap()       – called by TwzmModel destructor.
+//   3. twz_object_map() the tensor-data object (required) and, if present,
+//      the vocab object - both referenced from the root header.
+//   4. llama_model_init_from_user() – build llama_model from metadata +
+//        set_tensor_data_cb that sets tensor->data pointers into the
+//        tensor-data mapping, and (if present) the vocab mapping for
+//        fast vocab loading.
+//   5. All three mappings are kept alive for the model's lifetime (no
+//      model-destruction hook exists to unmap them automatically).
 
 #pragma once
 
@@ -66,30 +83,40 @@ typedef struct {
 // ---------------------------------------------------------------------------
 
 #define TWZM_MAGIC   0x4D5A5754u  // "TWZM" (little-endian)
-#define TWZM_VERSION 1u
+#define TWZM_VERSION 2u
 
 #define TWZM_TENSOR_NAME_MAX 96   // maximum tensor name length incl. NUL
 
-// Fixed-size object header at byte 0.
+// A reference to a byte range inside another Twizzler object: an id plus a
+// byte offset within that object. {0,0} id means "absent/unset". offset is
+// always 0 today (each referenced object below is dedicated to exactly one
+// section) but is a real field - not assumed zero - so a future phase that
+// co-locates sections in one object doesn't need another format bump.
+typedef struct __attribute__((packed)) {
+    twz_objid id;
+    uint64_t  offset;
+} TwzmGlobalPtr;
+
+// Fixed-size root/metadata object header at byte 0.
 typedef struct __attribute__((packed)) {
     uint32_t magic;               // Must equal TWZM_MAGIC.
     uint32_t version;             // Must equal TWZM_VERSION.
-    uint64_t metadata_offset;     // Byte offset to the GGUF metadata blob.
+    uint64_t metadata_offset;     // Byte offset (within THIS object) to the GGUF metadata blob.
     uint64_t metadata_size;       // Byte length of the GGUF metadata blob.
-    uint64_t tensor_index_offset; // Byte offset to the tensor index array.
+    uint64_t tensor_index_offset; // Byte offset (within THIS object) to the tensor index array.
     uint64_t tensor_count;        // Number of entries in the tensor index.
     // Process-local model pointer cache.  Written at runtime via a COW page
     // (MAP_PRIVATE, so the on-disk file is never modified).  On Twizzler this
     // would be a persistent pointer fixed up on remap.  Zero means uncached.
     uint64_t cached_model_ptr;
-    uint64_t vocab_offset;        // Byte offset to flat vocab section (0 = absent).
-    uint64_t vocab_size;          // Byte length of flat vocab section.
+    TwzmGlobalPtr vocab;          // Flat vocab section object (absent = no fast-load vocab).
+    TwzmGlobalPtr tensor_data;    // Tensor data object (required).
 } TwzmHeader;
 
 // One entry in the tensor index.
 typedef struct __attribute__((packed)) {
     char     name[TWZM_TENSOR_NAME_MAX]; // Tensor name (null-terminated).
-    uint64_t data_offset;                // Byte offset within the object.
+    uint64_t data_offset;                // Byte offset within the tensor-data object.
     uint64_t data_size;                  // Byte length of the tensor data.
 } TwzmTensorEntry;
 
@@ -97,10 +124,13 @@ typedef struct __attribute__((packed)) {
 #define TWZM_DATA_ALIGNMENT 4096u
 
 // ---------------------------------------------------------------------------
-// Flat vocab section format (at vocab_offset in the TWZM object)
+// Flat vocab section format (the entire content of the vocab object,
+// referenced from TwzmHeader.vocab)
 //
 // The vocab section lets the loader skip gguf_init_from_buffer and load_vocab
-// entirely on first load, avoiding 150ms+ of hash-table construction.
+// entirely on first load, avoiding 150ms+ of hash-table construction. All
+// offsets below are relative to the start of the vocab section/object
+// itself (i.e. relative to TwzmHeader.vocab.offset, not the root object).
 //
 // Layout:
 //   TwzmVocabHeader  (60 bytes, fixed)
@@ -185,9 +215,13 @@ struct llama_model * llama_model_load_from_twizzler_object(
     struct llama_model_params params);
 
 // Load directly from a .twzm file path on the local filesystem.
-// The file is mmap'd read-only; the mapping is retained for the model's
-// lifetime (released on process exit).  Callers needing explicit lifetime
-// control should use llama_model_load_from_twzm() with a caller-managed map.
+// The root file is mmap'd read-only by path; its tensor-data object (and
+// vocab object, if present) are then resolved and mapped by id via
+// TWZ_OBJECT_PATH (see twizzler_platform.h) - it must be set consistently
+// with however `gguf-to-twzm` was run to produce this file. All mappings
+// are retained for the model's lifetime (released on process exit).
+// Callers needing explicit lifetime control should use
+// llama_model_load_from_twzm() with a caller-managed map.
 // Returns NULL on failure (error is logged to stderr).
 struct llama_model * llama_model_load_from_twzm_path(
     const char * path,

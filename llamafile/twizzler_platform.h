@@ -82,6 +82,24 @@ void * twz_object_resize(void * base, size_t old_size, size_t new_size);
 // twz_object_create()/twz_object_create_at_path()/twz_object_resize().
 void twz_object_finalize(void * base, size_t size);
 
+// Generate a fresh, currently-unused 128-bit object id and atomically
+// create+map it read-write of `size` bytes (same semantics as
+// twz_object_create() otherwise - use twz_object_finalize() when done).
+// On success *out_id is set to the generated id. On failure NULL is
+// returned and *out_id is zeroed.
+//
+// Used by writers (e.g. gguf-to-twzm) that need to create a new object
+// without already knowing what id to give it - unlike twz_object_create(),
+// which requires the caller to supply one (e.g. a root object addressed by
+// a fixed CLI output path has no id of its own to pick).
+void * twz_object_create_fresh(twz_objid * out_id, size_t size);
+
+// Best-effort delete of an object by id. Ignores "does not exist". Not for
+// use on a still-mapped object - twz_object_finalize()/twz_object_unmap()
+// it first. Intended for failure-path cleanup of objects created via
+// twz_object_create_fresh()/twz_object_create().
+void twz_object_destroy(twz_objid id);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif
