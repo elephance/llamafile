@@ -103,13 +103,26 @@ typedef struct __attribute__((packed)) {
 // entirely on first load, avoiding 150ms+ of hash-table construction.
 //
 // Layout:
-//   TwzmVocabHeader  (32 bytes, fixed)
+//   TwzmVocabHeader  (60 bytes, fixed)
 //   id_data[]        (n_vocab × 12 bytes)  score+attr+text_offset per token
 //   merges[]         (n_merges × 4 bytes)  text_offset of "p1 p2\0" merge string
 //   text_pool        (text_pool_size bytes) all strings, null-terminated
 //   token_hash[]     (token_hash_capacity × 12 bytes) open-addressing hash table
 //                     for O(1) text→token_id lookup.  Empty slots have
 //                     token_id = -1.  Sized to keep load factor < 75%.
+//   merge_hash[]     (merge_hash_capacity × 12 bytes) open-addressing hash table
+//                     for O(1) "left right"→rank lookup (find_bpe_rank), same
+//                     entry layout as token_hash[] with token_id repurposed to
+//                     hold the merge rank.  Keyed by the exact "p1 p2" merge
+//                     text (as stored in merges[]/text_pool), hashed the same
+//                     way as token text.  Empty slots have token_id = -1.
+//   piece_data[]     (n_vocab × 8 bytes) TwzmPieceEntry per token: the
+//                     precomputed llama_token_to_piece(id, special=true)
+//                     result, computed once at conversion time (see
+//                     gguf_to_twzm.cpp) instead of at every load.
+//   piece_pool       (piece_pool_size bytes) concatenated piece bytes,
+//                     addressed by piece_data[]. NOT null-terminated -
+//                     byte-fallback tokens can decode to any byte incl. 0x00.
 // ---------------------------------------------------------------------------
 
 #define TWZM_VOCAB_MAGIC 0x4D435657u  // "WVCM"
@@ -123,6 +136,13 @@ typedef struct __attribute__((packed)) {
     uint32_t token_hash_offset;    // byte offset from start of vocab section to hash table (0 = absent)
     uint32_t token_hash_capacity;  // number of slots in the hash table (power of two)
     uint32_t token_hash_count;     // number of occupied slots
+    uint32_t merge_hash_offset;    // byte offset from start of vocab section to merge-rank hash table (0 = absent)
+    uint32_t merge_hash_capacity;  // number of slots in the merge-rank hash table (power of two)
+    uint32_t merge_hash_count;     // number of occupied slots (== n_merges when present)
+    uint32_t piece_data_offset;    // byte offset from start of vocab section to piece_data[] (0 = absent)
+    uint32_t piece_pool_offset;    // byte offset from start of vocab section to piece_pool
+    uint32_t piece_pool_size;      // byte size of piece_pool
+    uint32_t max_token_len;        // longest token text, in bytes (precomputed, avoids a strlen() scan at load)
 } TwzmVocabHeader;
 
 typedef struct __attribute__((packed)) {
@@ -131,13 +151,20 @@ typedef struct __attribute__((packed)) {
     uint32_t text_offset;     // byte offset into text_pool
 } TwzmTokenData;
 
-// One entry in the open-addressing token hash table.
+// One entry in the open-addressing token hash table (also reused, as-is, for
+// the merge-rank hash table - see TwzmVocabHeader.merge_hash_offset).
 // Empty slots have token_id = -1 (LLAMA_TOKEN_NULL).
 typedef struct __attribute__((packed)) {
-    uint32_t hash_value;      // FNV-1a hash of the token text
-    int32_t  token_id;        // llama_token (or -1 for empty)
+    uint32_t hash_value;      // FNV-1a hash of the token (or "left right" merge) text
+    int32_t  token_id;        // llama_token, or merge rank in merge_hash[] (or -1 for empty)
     uint32_t text_offset;     // byte offset into text_pool
 } TwzmTokenHashEntry;
+
+// One entry in piece_data[] - see TwzmVocabHeader.piece_data_offset.
+typedef struct __attribute__((packed)) {
+    uint32_t piece_offset;    // byte offset into piece_pool
+    uint32_t piece_length;    // length in bytes (NOT null-terminated)
+} TwzmPieceEntry;
 
 // ---------------------------------------------------------------------------
 // Public API

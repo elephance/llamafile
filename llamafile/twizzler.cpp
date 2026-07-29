@@ -40,20 +40,12 @@
 #include "../llama.cpp/ggml/include/ggml.h"
 #include "../llama.cpp/ggml/include/ggml-backend.h" // for ggml_backend_tensor_set
 
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
 #include <time.h>
-#include <unistd.h>
 
 #include <cinttypes>
 #include <cstdio>
 #include <cstring>
-#include <cerrno>
-#include <stdexcept>
-#include <string>
 #include <vector>
-#include <unordered_map>
 
 // Set TWZM_DEBUG=1 in the environment to enable verbose tracing.
 static int twzm_debug_level() {
@@ -338,45 +330,30 @@ struct llama_model * llama_model_load_from_twzm(
     params.use_mmap        = false;
     params.use_extra_bufts = false;
 
+    // Determine the TWZM flat vocab section pointer (for fast vocab loading).
+    const void * twzm_vocab_section = nullptr;
+    if (hdr->vocab_offset != 0 && hdr->vocab_size >= 32) {
+        twzm_vocab_section = static_cast<const uint8_t *>(base) + hdr->vocab_offset;
+    }
+
     struct llama_model * model =
-        llama_model_init_from_user(gguf_ctx, twzm_set_tensor_data, &loader, params);
+        llama_model_init_from_user(gguf_ctx, twzm_set_tensor_data, &loader, params, twzm_vocab_section);
     TWZM_STAGE("llama_model_init_from_user");
 
-    // 4b. Replace token_to_id with the pre-built hash table if available.
-    //     load_vocab already built it the slow way (unordered_map inserts);
-    //     we swap in the hash-table-populated version for ~zero-cost lookups.
-    if (hdr->vocab_offset != 0 && hdr->vocab_size >= sizeof(TwzmVocabHeader)) {
-        const auto * vhdr = reinterpret_cast<const TwzmVocabHeader *>(
-            static_cast<const uint8_t *>(base) + hdr->vocab_offset);
-        if (vhdr->magic == TWZM_VOCAB_MAGIC &&
-            vhdr->token_hash_offset > 0 &&
-            vhdr->token_hash_capacity > 0) {
-            const char * text_pool = static_cast<const char *>(base) + hdr->vocab_offset +
-                sizeof(TwzmVocabHeader) +
-                vhdr->n_vocab * sizeof(TwzmTokenData) +
-                vhdr->n_merges * sizeof(uint32_t);
-            const void * hash_tbl = text_pool + vhdr->text_pool_size;
-
-            const struct llama_vocab * vocab = llama_model_get_vocab(model);
-            if (vocab) {
-                TWZM_LOG("vocab n_tokens before hash table: %d", llama_vocab_n_tokens(vocab));
-                llama_vocab_load_token_to_id_from_hash_table(
-                    vocab, hash_tbl, vhdr->token_hash_capacity, text_pool);
-                TWZM_LOG("replaced token_to_id from pre-built hash table "
-                         "(%" PRIu32 " entries, %" PRIu32 " capacity)",
-                         vhdr->token_hash_count, vhdr->token_hash_capacity);
-                TWZM_LOG("vocab n_tokens after hash table: %d", llama_vocab_n_tokens(vocab));
-                // Sanity check: tokenize a simple string and log result.
-                if (twzm_debug_level() > 0) {
-                    const char * test = "Hello";
-                    std::vector<llama_token> toks;
-                    toks.resize(16);
-                    int32_t n = llama_tokenize(vocab, test, strlen(test), toks.data(), toks.size(), false, false);
-                    fprintf(stderr, "twzm:   test tokenize '%s' -> %d tokens:", test, n);
-                    for (int32_t i = 0; i < n && i < 8; ++i) fprintf(stderr, " %d", toks[i]);
-                    fprintf(stderr, "\n");
-                }
-            }
+    // Note: the TWZM hash-table wiring (pointing token_to_id lookups directly
+    // at the mmap'd on-disk hash table when present) now happens inside
+    // llama_vocab::impl::load() itself, during model init above - no post-hoc
+    // swap-in needed here.
+    if (twzm_debug_level() > 0) {
+        const struct llama_vocab * vocab = llama_model_get_vocab(model);
+        if (vocab) {
+            const char * test = "Hello";
+            std::vector<llama_token> toks;
+            toks.resize(16);
+            int32_t n = llama_tokenize(vocab, test, strlen(test), toks.data(), toks.size(), false, false);
+            fprintf(stderr, "twzm:   test tokenize '%s' -> %d tokens:", test, n);
+            for (int32_t i = 0; i < n && i < 8; ++i) fprintf(stderr, " %d", toks[i]);
+            fprintf(stderr, "\n");
         }
     }
 
@@ -419,42 +396,20 @@ struct llama_model * llama_model_load_from_twzm(
 struct llama_model * llama_model_load_from_twzm_path(
         const char * path,
         struct llama_model_params params) {
-    // Reuse the same mapping across calls for the same path so that the
-    // cached_model_ptr written into the header is visible on the next call.
-    static std::unordered_map<std::string, std::pair<void*, size_t>> s_mappings;
-    auto it = s_mappings.find(path);
-    void * base;
-    size_t sz;
-    if (it != s_mappings.end()) {
-        base = it->second.first;
-        sz   = it->second.second;
-    } else {
-        int fd = open(path, O_RDONLY | O_CLOEXEC);
-        if (fd < 0) {
-            fprintf(stderr, "twzm: cannot open '%s': %s\n", path, strerror(errno));
-            return nullptr;
-        }
-        struct stat st;
-        if (fstat(fd, &st) < 0) {
-            fprintf(stderr, "twzm: fstat '%s' failed: %s\n", path, strerror(errno));
-            close(fd);
-            return nullptr;
-        }
-        sz = (size_t)st.st_size;
-        // MAP_PRIVATE + PROT_WRITE: writes are copy-on-write (file never modified).
-        // Required so the COW cache write into the header doesn't segfault.
-        base = mmap(nullptr, sz, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
-        close(fd);
-        if (base == MAP_FAILED) {
-            fprintf(stderr, "twzm: mmap '%s' failed: %s\n", path, strerror(errno));
-            return nullptr;
-        }
-        s_mappings[path] = {base, sz};
+    // twz_object_map_at_path() keeps its own path-keyed mapping cache
+    // (shared with twz_object_map()'s objid-based callers), so the same
+    // mapping - and the cached_model_ptr written into its header - is
+    // reused across repeat calls for the same path without a second cache
+    // living here too.
+    size_t sz = 0;
+    void * base = twz_object_map_at_path(path, &sz);
+    if (!base) {
+        return nullptr;
     }
+
     struct llama_model * model = llama_model_load_from_twzm(base, sz, params);
     if (!model) {
-        s_mappings.erase(path);
-        munmap(base, sz);
+        twz_object_unmap(base, sz);
     }
     return model;
 }

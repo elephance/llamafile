@@ -475,7 +475,8 @@ o/$(MODE)/llamafile/iqk_mul_mat_arm82.o: \
 # llama_model_init_from_user).  Does not pull in the TUI, server, or GPU stack.
 
 GGUF_TO_TWZM_OBJS = \
-	o/$(MODE)/llamafile/gguf_to_twzm.o
+	o/$(MODE)/llamafile/gguf_to_twzm.o \
+	o/$(MODE)/llamafile/twizzler_linux.o
 
 GGUF_TO_TWZM_DEPS = \
 	$(GGML_OBJS) \

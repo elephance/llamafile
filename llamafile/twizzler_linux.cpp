@@ -14,17 +14,16 @@
 
 // Linux shim for Twizzler memory-object mapping.
 //
-// Implements twz_object_map() / twz_object_unmap() for development and
-// testing on Linux without Twizzler OS.
+// Implements the twz_object_* API (declared in twizzler_platform.h) for
+// development and testing on Linux without Twizzler OS: both read-only
+// (copy-on-write) mapping of existing objects, and creation/growth of
+// writable objects for the format converter.
 //
 // Object resolution:
 //   The object file is looked up as:
 //       ${TWZ_OBJECT_PATH:-./twzm_objects}/<hi_hex>_<lo_hex>.twzm
 //   where <hi_hex> and <lo_hex> are the zero-padded 16-character hex
 //   representations of twz_objid.hi and twz_objid.lo respectively.
-//
-// The file is opened read-only and its entire contents are mmap'd with
-// MAP_PRIVATE.  The mapping size is the file size.
 
 #ifndef TWIZZLER // only compile on Linux; real Twizzler gets its own impl
 
@@ -54,21 +53,20 @@ static int twz_object_path(twz_objid id, char * buf, size_t buf_size) {
     return n > 0 && (size_t)n < buf_size;
 }
 
-// Per-process table of open TWZM mappings keyed by file path.
+// ---------------------------------------------------------------------------
+// Read-only (copy-on-write) mapping cache, keyed by resolved path.
+//
 // Keeping the same mapping alive lets llama_model_load_from_twzm() find the
-// cached_model_ptr it wrote into the header on first load.
+// cached_model_ptr it wrote into the header on first load. Shared by both
+// the objid-based (twz_object_map) and direct-path (twz_object_map_at_path)
+// entry points, so there is exactly one cache instead of one per caller.
+// ---------------------------------------------------------------------------
+
 struct TwzmMapping { void * base; size_t size; };
 static std::unordered_map<std::string, TwzmMapping> g_twzm_mappings;
 
-void * twz_object_map(twz_objid id, size_t * out_size) {
+void * twz_object_map_at_path(const char * path, size_t * out_size) {
     *out_size = 0;
-
-    char path[4096];
-    if (!twz_object_path(id, path, sizeof(path))) {
-        fprintf(stderr, "twz_object_map: path too long for object %016" PRIx64
-                "_%016" PRIx64 "\n", id.hi, id.lo);
-        return NULL;
-    }
 
     // Re-use an existing mapping for this path if we have one.
     auto it = g_twzm_mappings.find(path);
@@ -115,10 +113,142 @@ void * twz_object_map(twz_objid id, size_t * out_size) {
     return ptr;
 }
 
-void twz_object_unmap(void * base, size_t size) {
-    if (base && size) {
-        munmap(base, size);
+void * twz_object_map(twz_objid id, size_t * out_size) {
+    *out_size = 0;
+
+    char path[4096];
+    if (!twz_object_path(id, path, sizeof(path))) {
+        fprintf(stderr, "twz_object_map: path too long for object %016" PRIx64
+                "_%016" PRIx64 "\n", id.hi, id.lo);
+        return NULL;
     }
+
+    return twz_object_map_at_path(path, out_size);
+}
+
+void twz_object_unmap(void * base, size_t size) {
+    if (!base || !size) {
+        return;
+    }
+
+    // Evict from the read-only mapping cache, if present, so a subsequent
+    // twz_object_map()/twz_object_map_at_path() call for the same path
+    // doesn't hand back a now-dangling pointer.
+    for (auto it = g_twzm_mappings.begin(); it != g_twzm_mappings.end(); ++it) {
+        if (it->second.base == base) {
+            g_twzm_mappings.erase(it);
+            break;
+        }
+    }
+
+    munmap(base, size);
+}
+
+// ---------------------------------------------------------------------------
+// Writable object creation (for the format converter / any writer).
+//
+// Separate from the read-only cache above: writable mappings are one-shot
+// (created, written, finalized) and are never looked up by path. But
+// twz_object_resize()/twz_object_finalize() only receive a base pointer, so
+// we track which fd/size backs each currently-active writable mapping.
+// ---------------------------------------------------------------------------
+
+struct TwzmWritableMapping { int fd; size_t size; };
+static std::unordered_map<void *, TwzmWritableMapping> g_writable_mappings;
+
+void * twz_object_create_at_path(const char * path, size_t size) {
+    if (size == 0) {
+        fprintf(stderr, "twz_object_create: cannot create a zero-size object ('%s')\n", path);
+        return NULL;
+    }
+
+    int fd = open(path, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0) {
+        fprintf(stderr, "twz_object_create: cannot create '%s': %s\n",
+                path, strerror(errno));
+        return NULL;
+    }
+
+    // Zero-fills the file up to `size` (sparse on most filesystems).
+    if (ftruncate(fd, (off_t)size) != 0) {
+        fprintf(stderr, "twz_object_create: ftruncate '%s' to %zu bytes failed: %s\n",
+                path, size, strerror(errno));
+        close(fd);
+        return NULL;
+    }
+
+    // MAP_SHARED + PROT_WRITE: writes ARE persisted to backing storage,
+    // unlike the copy-on-write mapping from twz_object_map()/_at_path().
+    void * ptr = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (ptr == MAP_FAILED) {
+        fprintf(stderr, "twz_object_create: mmap '%s' (%zu bytes) failed: %s\n",
+                path, size, strerror(errno));
+        close(fd);
+        return NULL;
+    }
+
+    g_writable_mappings[ptr] = TwzmWritableMapping{fd, size};
+    return ptr;
+}
+
+void * twz_object_create(twz_objid id, size_t size) {
+    char path[4096];
+    if (!twz_object_path(id, path, sizeof(path))) {
+        fprintf(stderr, "twz_object_create: path too long for object %016" PRIx64
+                "_%016" PRIx64 "\n", id.hi, id.lo);
+        return NULL;
+    }
+
+    return twz_object_create_at_path(path, size);
+}
+
+void * twz_object_resize(void * base, size_t old_size, size_t new_size) {
+    auto it = g_writable_mappings.find(base);
+    if (it == g_writable_mappings.end()) {
+        fprintf(stderr, "twz_object_resize: %p is not a live writable mapping\n", base);
+        return NULL;
+    }
+    if (it->second.size != old_size) {
+        fprintf(stderr, "twz_object_resize: old_size %zu does not match tracked size %zu\n",
+                old_size, it->second.size);
+        return NULL;
+    }
+
+    int fd = it->second.fd;
+    if (ftruncate(fd, (off_t)new_size) != 0) {
+        fprintf(stderr, "twz_object_resize: ftruncate to %zu bytes failed: %s\n",
+                new_size, strerror(errno));
+        return NULL;
+    }
+
+    void * new_base = mremap(base, old_size, new_size, MREMAP_MAYMOVE);
+    if (new_base == MAP_FAILED) {
+        fprintf(stderr, "twz_object_resize: mremap to %zu bytes failed: %s\n",
+                new_size, strerror(errno));
+        return NULL;
+    }
+
+    g_writable_mappings.erase(it);
+    g_writable_mappings[new_base] = TwzmWritableMapping{fd, new_size};
+    return new_base;
+}
+
+void twz_object_finalize(void * base, size_t size) {
+    auto it = g_writable_mappings.find(base);
+    if (it == g_writable_mappings.end()) {
+        fprintf(stderr, "twz_object_finalize: %p is not a live writable mapping\n", base);
+        return;
+    }
+    if (it->second.size != size) {
+        fprintf(stderr, "twz_object_finalize: size %zu does not match tracked size %zu\n",
+                size, it->second.size);
+    }
+
+    int fd = it->second.fd;
+    msync(base, size, MS_SYNC);
+    munmap(base, size);
+    close(fd);
+    g_writable_mappings.erase(it);
 }
 
 #endif // !TWIZZLER

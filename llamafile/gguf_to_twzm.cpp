@@ -30,6 +30,9 @@
 // where A = 64 + tensor_count×128 and B = ALIGN(A + metadata_size, PAGE).
 
 #include "twizzler.h"
+#include "twizzler_platform.h"
+
+#include "../llama.cpp/include/llama.h"
 
 // Use relative path to avoid llamafile/llama.h shadowing the real gguf header.
 #include "../llama.cpp/ggml/include/gguf.h"
@@ -42,25 +45,32 @@
 #include <cstring>
 #include <vector>
 
+// FNV-1a 32-bit hash (must match llama.cpp/src/llama-vocab.cpp).
+static uint32_t fnv1a(const uint8_t * data, size_t len) {
+    uint32_t h = 2166136261u;
+    for (size_t i = 0; i < len; ++i) {
+        h ^= data[i];
+        h *= 16777619u;
+    }
+    return h;
+}
+
+static uint32_t next_pow2(uint32_t x) {
+    uint32_t p = 1;
+    while (p < x) {
+        p <<= 1;
+    }
+    return p;
+}
+
 // Align `v` up to the next multiple of `align` (must be a power of two).
 static uint64_t align_up(uint64_t v, uint64_t align) {
     return (v + align - 1u) & ~(align - 1u);
 }
 
-// Write `size` zero bytes to `fp`.
-static bool write_zeros(FILE * fp, size_t size) {
-    const size_t chunk = 65536;
-    static const uint8_t zeros[65536] = {};
-    while (size > 0) {
-        size_t n = size < chunk ? size : chunk;
-        if (fwrite(zeros, 1, n, fp) != n) return false;
-        size -= n;
-    }
-    return true;
-}
-
-// Copy `len` bytes starting at `src_offset` from `src` to `dst`.
-static bool copy_bytes(FILE * dst, FILE * src, uint64_t src_offset, uint64_t len) {
+// Copy `len` bytes starting at `src_offset` in `src` to `dst + dst_offset`,
+// where `dst` points into a mapped, writable TWZM object.
+static bool copy_bytes(uint8_t * dst, uint64_t dst_offset, FILE * src, uint64_t src_offset, uint64_t len) {
     if (fseeko(src, (off_t)src_offset, SEEK_SET) != 0) {
         fprintf(stderr, "gguf-to-twzm: fseeko failed: %s\n", strerror(errno));
         return false;
@@ -69,6 +79,7 @@ static bool copy_bytes(FILE * dst, FILE * src, uint64_t src_offset, uint64_t len
     const size_t buf_size = 1 << 20; // 1 MiB
     std::vector<uint8_t> buf(buf_size);
     uint64_t remaining = len;
+    uint64_t off = dst_offset;
 
     while (remaining > 0) {
         size_t to_read = remaining < buf_size ? (size_t)remaining : buf_size;
@@ -78,10 +89,8 @@ static bool copy_bytes(FILE * dst, FILE * src, uint64_t src_offset, uint64_t len
                     remaining);
             return false;
         }
-        if (fwrite(buf.data(), 1, got, dst) != got) {
-            fprintf(stderr, "gguf-to-twzm: fwrite failed: %s\n", strerror(errno));
-            return false;
-        }
+        memcpy(dst + off, buf.data(), got);
+        off += got;
         remaining -= got;
     }
     return true;
@@ -99,6 +108,11 @@ int main(int argc, char ** argv) {
     }
     const char * in_path  = argv[1];
     const char * out_path = argv[2];
+
+    // Needed later (step 8) for a vocab_only model load, used to precompute
+    // the token-to-piece cache. Cheap in this build (CPU-only, statically
+    // linked backend - no dlopen/directory scan).
+    llama_backend_init();
 
     // -----------------------------------------------------------------------
     // 1. Parse the GGUF metadata (no tensor data allocation).
@@ -216,7 +230,7 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "  output size:     %" PRIu64 " bytes\n", total_file_size);
 
     // -----------------------------------------------------------------------
-    // 3. Open input GGUF as raw bytes and output file for writing.
+    // 3. Open input GGUF as raw bytes and create the output object.
     // -----------------------------------------------------------------------
     FILE * fin = fopen(in_path, "rb");
     if (!fin) {
@@ -225,9 +239,12 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    FILE * fout = fopen(out_path, "wb");
-    if (!fout) {
-        fprintf(stderr, "gguf-to-twzm: cannot create '%s': %s\n", out_path, strerror(errno));
+    // twz_object_create_at_path() creates+truncates the file to
+    // total_file_size (zero-filled) and maps it read-write, so there is no
+    // separate "extend to the last page boundary" step needed afterwards.
+    uint8_t * obj = static_cast<uint8_t *>(twz_object_create_at_path(out_path, total_file_size));
+    if (!obj) {
+        fprintf(stderr, "gguf-to-twzm: cannot create '%s'\n", out_path);
         fclose(fin);
         gguf_free(gguf_ctx);
         return 1;
@@ -236,33 +253,26 @@ int main(int argc, char ** argv) {
     // -----------------------------------------------------------------------
     // 4. Write TwzmHeader.
     // -----------------------------------------------------------------------
-    TwzmHeader hdr = {};
-    hdr.magic               = TWZM_MAGIC;
-    hdr.version             = TWZM_VERSION;
-    hdr.metadata_offset     = metadata_off;
-    hdr.metadata_size       = metadata_size;
-    hdr.tensor_index_offset = tensor_index_off;
-    hdr.tensor_count        = (uint64_t)n_entries; // sorted; includes aliases
-
-    if (fwrite(&hdr, sizeof(hdr), 1, fout) != 1) {
-        fprintf(stderr, "gguf-to-twzm: failed to write header\n");
-        goto fail;
+    {
+        TwzmHeader hdr = {};
+        hdr.magic               = TWZM_MAGIC;
+        hdr.version             = TWZM_VERSION;
+        hdr.metadata_offset     = metadata_off;
+        hdr.metadata_size       = metadata_size;
+        hdr.tensor_index_offset = tensor_index_off;
+        hdr.tensor_count        = (uint64_t)n_entries; // sorted; includes aliases
+        memcpy(obj, &hdr, sizeof(hdr));
     }
 
     // -----------------------------------------------------------------------
     // 5. Write sorted tensor index.
     // -----------------------------------------------------------------------
-    for (int64_t i = 0; i < n_entries; ++i) {
-        if (fwrite(&index[i], sizeof(TwzmTensorEntry), 1, fout) != 1) {
-            fprintf(stderr, "gguf-to-twzm: failed to write tensor index entry %" PRId64 "\n", i);
-            goto fail;
-        }
-    }
+    memcpy(obj + tensor_index_off, index.data(), (size_t)tensor_index_size);
 
     // -----------------------------------------------------------------------
     // 6. Write GGUF metadata blob (bytes [0, gguf_data_offset) of input file).
     // -----------------------------------------------------------------------
-    if (!copy_bytes(fout, fin, 0, metadata_size)) {
+    if (!copy_bytes(obj, metadata_off, fin, 0, metadata_size)) {
         fprintf(stderr, "gguf-to-twzm: failed to copy GGUF metadata blob\n");
         goto fail;
     }
@@ -273,17 +283,12 @@ int main(int argc, char ** argv) {
     //    GGUF tensor was assigned regardless of the sorted index order.
     // -----------------------------------------------------------------------
     for (int64_t i = 0; i < n_tensors; ++i) {
-        if (fseeko(fout, (off_t)gguf_tensor_data_off[i], SEEK_SET) != 0) {
-            fprintf(stderr, "gguf-to-twzm: fseeko output failed: %s\n", strerror(errno));
-            goto fail;
-        }
-
         // gguf_get_tensor_offset() returns the offset of tensor i within the
         // GGUF data section (i.e. relative to gguf_data_offset, not file start).
         uint64_t in_offset = gguf_data_offset + (uint64_t)gguf_get_tensor_offset(gguf_ctx, i);
         uint64_t in_size   = (uint64_t)gguf_get_tensor_size(gguf_ctx, i);
 
-        if (!copy_bytes(fout, fin, in_offset, in_size)) {
+        if (!copy_bytes(obj, gguf_tensor_data_off[i], fin, in_offset, in_size)) {
             fprintf(stderr, "gguf-to-twzm: failed to copy tensor '%s'\n",
                     gguf_get_tensor_name(gguf_ctx, i));
             goto fail;
@@ -295,21 +300,8 @@ int main(int argc, char ** argv) {
     }
     fprintf(stderr, "\n");
 
-    // Ensure output file extends to total_file_size (last page boundary).
-    // This matters if the last tensor data doesn't fill its page.
-    {
-        long cur = ftello(fout);
-        if (cur >= 0 && (uint64_t)cur < total_file_size) {
-            if (fseeko(fout, (off_t)(total_file_size - 1), SEEK_SET) != 0 ||
-                fputc(0, fout) == EOF) {
-                fprintf(stderr, "gguf-to-twzm: failed to extend output file\n");
-                goto fail;
-            }
-        }
-    }
-
     fclose(fin);
-    fclose(fout);
+    fin = nullptr;
     gguf_free(gguf_ctx);
     fprintf(stderr, "gguf-to-twzm: wrote '%s'\n", out_path);
 
@@ -319,8 +311,7 @@ int main(int argc, char ** argv) {
     {
         // Re-open gguf_ctx to read token data.
         struct gguf_context * vctx = gguf_init_from_file(in_path, gguf_params);
-        FILE * fv = fopen(out_path, "r+b");
-        if (vctx && fv) {
+        if (vctx) {
             // Find tokenizer KV indices.
             const int tok_idx   = gguf_find_key(vctx, "tokenizer.ggml.tokens");
             const int score_idx = gguf_find_key(vctx, "tokenizer.ggml.scores");
@@ -337,16 +328,19 @@ int main(int argc, char ** argv) {
                 if (strcmp(vm, "llama") == 0)   vtype = 2;
                 else if (strcmp(vm, "gpt2") == 0)  vtype = 2;
                 else if (strcmp(vm, "bert") == 0)  vtype = 3;
-                else if (strcmp(vm, "rwkv") == 0)  vtype = 4;
+                else if (strcmp(vm, "rwkv") == 0)  vtype = 5;
             }
 
             // Build text pool: tokens then merges.
             std::vector<uint8_t> pool;
             std::vector<uint32_t> tok_offsets(nv), merge_offsets(nm);
+            uint32_t max_token_len = 0;
             for (uint32_t i = 0; i < nv; ++i) {
                 tok_offsets[i] = (uint32_t)pool.size();
                 const char * s = (tok_idx >= 0) ? gguf_get_arr_str(vctx, tok_idx, i) : "";
-                size_t len = strlen(s) + 1;
+                size_t slen = strlen(s);
+                if (slen > max_token_len) max_token_len = (uint32_t)slen;
+                size_t len = slen + 1;
                 pool.insert(pool.end(), s, s + len);
             }
             for (uint32_t i = 0; i < nm; ++i) {
@@ -356,12 +350,6 @@ int main(int argc, char ** argv) {
                 pool.insert(pool.end(), s, s + len);
             }
 
-            struct FlatHdr {
-                uint32_t magic, n_vocab, vocab_type, n_merges,
-                         text_pool_size, res[3];
-            } fh = {0x4D435657u, nv, vtype, nm,
-                    (uint32_t)pool.size(), {0,0,0}};
-
             // Per-token data (score, attr, text_offset).
             struct TokEntry { float score; int32_t attr; uint32_t text_offset; };
             std::vector<TokEntry> td(nv);
@@ -370,36 +358,208 @@ int main(int argc, char ** argv) {
             const int32_t * types  = (type_idx  >= 0) ?
                 (const int32_t *)gguf_get_arr_data(vctx, type_idx) : nullptr;
             for (uint32_t i = 0; i < nv; ++i) {
-                td[i].score       = scores ? scores[i] : 0.f;
-                td[i].attr        = types  ? types[i]  : 1; // NORMAL
+                td[i].score = scores ? scores[i] : 0.f;
+                int32_t attr = LLAMA_TOKEN_ATTR_NORMAL;
+                if (types) {
+                    switch (types[i]) {
+                        case LLAMA_TOKEN_TYPE_UNKNOWN:      attr = LLAMA_TOKEN_ATTR_UNKNOWN;      break;
+                        case LLAMA_TOKEN_TYPE_UNUSED:       attr = LLAMA_TOKEN_ATTR_UNUSED;       break;
+                        case LLAMA_TOKEN_TYPE_NORMAL:       attr = LLAMA_TOKEN_ATTR_NORMAL;       break;
+                        case LLAMA_TOKEN_TYPE_CONTROL:      attr = LLAMA_TOKEN_ATTR_CONTROL;      break;
+                        case LLAMA_TOKEN_TYPE_USER_DEFINED: attr = LLAMA_TOKEN_ATTR_USER_DEFINED; break;
+                        case LLAMA_TOKEN_TYPE_BYTE:         attr = LLAMA_TOKEN_ATTR_BYTE;         break;
+                        case LLAMA_TOKEN_TYPE_UNDEFINED:    attr = LLAMA_TOKEN_ATTR_UNDEFINED;    break;
+                        default:                            attr = LLAMA_TOKEN_ATTR_UNDEFINED;    break;
+                    }
+                }
+                td[i].attr        = attr;
                 td[i].text_offset = tok_offsets[i];
             }
 
-            // Seek to end of file and record vocab_offset.
-            fseeko(fv, 0, SEEK_END);
-            uint64_t voff = (uint64_t)ftello(fv);
+            // Header layout declared early so its size can be used below
+            // without a forward-reference chicken-and-egg problem.
+            struct FlatHdr {
+                uint32_t magic, n_vocab, vocab_type, n_merges, text_pool_size;
+                uint32_t token_hash_offset, token_hash_capacity, token_hash_count;
+                uint32_t merge_hash_offset, merge_hash_capacity, merge_hash_count;
+                uint32_t piece_data_offset, piece_pool_offset, piece_pool_size;
+                uint32_t max_token_len;
+            };
 
-            // Write: header, token data, merge offsets, text pool.
-            fwrite(&fh,               sizeof(fh),    1,    fv);
-            fwrite(td.data(),         sizeof(TokEntry), nv, fv);
-            fwrite(merge_offsets.data(), sizeof(uint32_t), nm, fv);
-            fwrite(pool.data(),       1, pool.size(),      fv);
+            // Build open-addressing hash tables (text -> id) so the loader can
+            // search them directly against the mmap'd file instead of building
+            // in-memory unordered_maps at load time. Must mirror
+            // llama_vocab::impl::hash_lookup()/merge_hash_lookup()'s probe
+            // sequence exactly (same fnv1a, same linear probing).
+            struct HashEntry { uint32_t hash_value; int32_t token_id; uint32_t text_offset; };
+            const char * pool_base = reinterpret_cast<const char *>(pool.data());
 
-            uint64_t vsize = (uint64_t)ftello(fv) - voff;
+            std::vector<HashEntry> hash_tbl;
+            uint32_t hash_cap = 0;
+            if (nv > 0) {
+                hash_cap = next_pow2((uint32_t)((nv * 4 + 2) / 3)); // load factor < 75%
+                if (hash_cap < 16) hash_cap = 16;
+                hash_tbl.assign(hash_cap, HashEntry{0, -1, 0});
+                for (uint32_t i = 0; i < nv; ++i) {
+                    const char * s = pool_base + tok_offsets[i];
+                    uint32_t h = fnv1a(reinterpret_cast<const uint8_t *>(s), strlen(s));
+                    uint32_t idx = h & (hash_cap - 1);
+                    while (hash_tbl[idx].token_id >= 0) {
+                        idx = (idx + 1) & (hash_cap - 1);
+                    }
+                    hash_tbl[idx] = HashEntry{h, (int32_t)i, tok_offsets[i]};
+                }
+            }
 
-            // Patch vocab_offset + vocab_size into the header at the fixed offsets.
-            // TwzmHeader layout: magic(4)+version(4)+meta_off(8)+meta_sz(8)+
-            //   idx_off(8)+n(8)+cached(8)+vocab_off(8)+vocab_sz(8) = 64 bytes
-            fseeko(fv, 48, SEEK_SET);  // offset of vocab_offset in header
-            fwrite(&voff,  sizeof(voff),  1, fv);
-            fwrite(&vsize, sizeof(vsize), 1, fv);
+            // Merge-rank hash table: keyed by the exact "p1 p2" merge text
+            // (as already stored in the pool at merge_offsets[i]); value is
+            // the merge rank (i). Lets find_bpe_rank() probe this directly
+            // instead of rebuilding an unordered_map<pair<string,string>,int>
+            // (bpe_ranks) at load time.
+            std::vector<HashEntry> merge_hash_tbl;
+            uint32_t merge_hash_cap = 0;
+            if (nm > 0) {
+                merge_hash_cap = next_pow2((uint32_t)((nm * 4 + 2) / 3));
+                if (merge_hash_cap < 16) merge_hash_cap = 16;
+                merge_hash_tbl.assign(merge_hash_cap, HashEntry{0, -1, 0});
+                for (uint32_t i = 0; i < nm; ++i) {
+                    const char * s = pool_base + merge_offsets[i];
+                    uint32_t h = fnv1a(reinterpret_cast<const uint8_t *>(s), strlen(s));
+                    uint32_t idx = h & (merge_hash_cap - 1);
+                    while (merge_hash_tbl[idx].token_id >= 0) {
+                        idx = (idx + 1) & (merge_hash_cap - 1);
+                    }
+                    merge_hash_tbl[idx] = HashEntry{h, (int32_t)i, merge_offsets[i]};
+                }
+            }
+
+            // Precompute the token-to-piece cache (llama_token_to_piece with
+            // special=true, lstrip=0 - matches token_to_piece_for_cache()'s
+            // call exactly) once, offline, instead of paying for it on every
+            // load. Uses a real vocab_only model load rather than
+            // reimplementing the decode logic, so this is guaranteed to
+            // match runtime output byte-for-byte (including the load-time
+            // special-token-by-text auto-detection, which raw GGUF metadata
+            // alone doesn't capture).
+            std::vector<uint8_t> piece_pool;
+            std::vector<TwzmPieceEntry> piece_entries;
+            {
+                llama_model_params vp = llama_model_default_params();
+                vp.vocab_only = true;
+                llama_model * vmodel = llama_model_load_from_file(in_path, vp);
+                if (vmodel) {
+                    const llama_vocab * vvocab = llama_model_get_vocab(vmodel);
+                    piece_entries.resize(nv);
+                    std::vector<char> buf(256);
+                    for (uint32_t id = 0; id < nv; ++id) {
+                        int32_t n = llama_token_to_piece(vvocab, (llama_token)id,
+                            buf.data(), (int32_t)buf.size(), 0, true);
+                        if (n < 0) {
+                            buf.resize((size_t)(-n));
+                            n = llama_token_to_piece(vvocab, (llama_token)id,
+                                buf.data(), (int32_t)buf.size(), 0, true);
+                        }
+                        piece_entries[id] = TwzmPieceEntry{(uint32_t)piece_pool.size(), (uint32_t)n};
+                        piece_pool.insert(piece_pool.end(), buf.begin(), buf.begin() + n);
+                    }
+                    llama_model_free(vmodel);
+                } else {
+                    fprintf(stderr, "gguf-to-twzm: warning: vocab_only load failed, "
+                            "piece cache will be rebuilt at load time instead\n");
+                    piece_entries.clear();
+                }
+            }
+
+            const uint32_t token_hash_offset = hash_tbl.empty() ? 0 : (uint32_t)(
+                sizeof(FlatHdr) +
+                sizeof(TokEntry) * nv +
+                sizeof(uint32_t) * nm +
+                pool.size());
+            const uint32_t merge_hash_offset = merge_hash_tbl.empty() ? 0 : (uint32_t)(
+                sizeof(FlatHdr) +
+                sizeof(TokEntry) * nv +
+                sizeof(uint32_t) * nm +
+                pool.size() +
+                hash_tbl.size() * sizeof(HashEntry));
+            const uint32_t piece_data_offset = piece_entries.empty() ? 0 : (uint32_t)(
+                sizeof(FlatHdr) +
+                sizeof(TokEntry) * nv +
+                sizeof(uint32_t) * nm +
+                pool.size() +
+                hash_tbl.size() * sizeof(HashEntry) +
+                merge_hash_tbl.size() * sizeof(HashEntry));
+            const uint32_t piece_pool_offset = piece_entries.empty() ? 0 :
+                piece_data_offset + (uint32_t)(piece_entries.size() * sizeof(TwzmPieceEntry));
+
+            FlatHdr fh = {0x4D435657u, nv, vtype, nm,
+                    (uint32_t)pool.size(), token_hash_offset, hash_cap, nv,
+                    merge_hash_offset, merge_hash_cap, nm,
+                    piece_data_offset, piece_pool_offset, (uint32_t)piece_pool.size(),
+                    max_token_len};
+
+            // Grow the object to append the vocab section after the current
+            // end (voff == total_file_size, the tensor-data region written
+            // above). vsize is computed directly from the pieces below
+            // rather than inferred from a file cursor.
+            const uint64_t voff = total_file_size;
+            const uint64_t vsize =
+                sizeof(fh) +
+                sizeof(TokEntry) * nv +
+                sizeof(uint32_t) * nm +
+                pool.size() +
+                hash_tbl.size() * sizeof(HashEntry) +
+                merge_hash_tbl.size() * sizeof(HashEntry) +
+                piece_entries.size() * sizeof(TwzmPieceEntry) +
+                piece_pool.size();
+
+            uint8_t * resized = static_cast<uint8_t *>(
+                twz_object_resize(obj, total_file_size, voff + vsize));
+            if (!resized) {
+                fprintf(stderr, "gguf-to-twzm: failed to grow object for vocab section\n");
+                twz_object_finalize(obj, total_file_size);
+                remove(out_path);
+                gguf_free(vctx);
+                return 1;
+            }
+            obj = resized;
+            total_file_size = voff + vsize;
+
+            // Write: header, token data, merge offsets, text pool, token
+            // hash table, merge hash table, piece data, piece pool.
+            uint64_t w = voff;
+            memcpy(obj + w, &fh, sizeof(fh));                          w += sizeof(fh);
+            memcpy(obj + w, td.data(), sizeof(TokEntry) * nv);         w += sizeof(TokEntry) * nv;
+            memcpy(obj + w, merge_offsets.data(), sizeof(uint32_t) * nm); w += sizeof(uint32_t) * nm;
+            memcpy(obj + w, pool.data(), pool.size());                 w += pool.size();
+            if (!hash_tbl.empty()) {
+                memcpy(obj + w, hash_tbl.data(), hash_tbl.size() * sizeof(HashEntry));
+                w += hash_tbl.size() * sizeof(HashEntry);
+            }
+            if (!merge_hash_tbl.empty()) {
+                memcpy(obj + w, merge_hash_tbl.data(), merge_hash_tbl.size() * sizeof(HashEntry));
+                w += merge_hash_tbl.size() * sizeof(HashEntry);
+            }
+            if (!piece_entries.empty()) {
+                memcpy(obj + w, piece_entries.data(), piece_entries.size() * sizeof(TwzmPieceEntry));
+                w += piece_entries.size() * sizeof(TwzmPieceEntry);
+                memcpy(obj + w, piece_pool.data(), piece_pool.size());
+                w += piece_pool.size();
+            }
+
+            // Patch vocab_offset + vocab_size directly into the header.
+            reinterpret_cast<TwzmHeader *>(obj)->vocab_offset = voff;
+            reinterpret_cast<TwzmHeader *>(obj)->vocab_size   = vsize;
 
             fprintf(stderr, "gguf-to-twzm: vocab section: %u tokens, %u merges, "
-                    "%" PRIu64 " bytes\n", nv, nm, vsize);
+                    "token hash %u/%u slots, merge hash %u/%u slots, "
+                    "piece cache %s, %" PRIu64 " bytes\n",
+                    nv, nm, nv, hash_cap, nm, merge_hash_cap,
+                    piece_entries.empty() ? "absent" : "precomputed", vsize);
         }
-        if (fv) fclose(fv);
         if (vctx) gguf_free(vctx);
     }
+
+    twz_object_finalize(obj, total_file_size);
 
     // -----------------------------------------------------------------------
     // 8. Optional verification: re-open both files and spot-check each tensor.
@@ -408,56 +568,56 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "gguf-to-twzm: verifying ...\n");
         int mismatches = 0;
 
+        size_t dst_size = 0;
+        const uint8_t * dst_map = static_cast<const uint8_t *>(
+            twz_object_map_at_path(out_path, &dst_size));
+        if (!dst_map) {
+            fprintf(stderr, "gguf-to-twzm: verify: cannot map output object\n");
+            return 1;
+        }
+
         // 1. Header sanity
         {
-            FILE * fhdr = fopen(out_path, "rb");
-            TwzmHeader whdr = {};
-            bool ok = fhdr && fread(&whdr, sizeof(whdr), 1, fhdr) == 1;
-            if (fhdr) fclose(fhdr);
-            if (!ok) {
-                fprintf(stderr, "gguf-to-twzm: verify: cannot read output header\n");
+            TwzmHeader whdr;
+            memcpy(&whdr, dst_map, sizeof(whdr));
+            if (whdr.magic != TWZM_MAGIC)
+                fprintf(stderr, "gguf-to-twzm: verify: wrong magic\n"), mismatches++;
+            if (whdr.version != TWZM_VERSION)
+                fprintf(stderr, "gguf-to-twzm: verify: wrong version\n"), mismatches++;
+            if (whdr.cached_model_ptr != 0) {
+                fprintf(stderr, "gguf-to-twzm: verify: cached_model_ptr is non-zero "
+                        "(%" PRIu64 ") in freshly written file\n", whdr.cached_model_ptr);
                 mismatches++;
-            } else {
-                if (whdr.magic != TWZM_MAGIC)
-                    fprintf(stderr, "gguf-to-twzm: verify: wrong magic\n"), mismatches++;
-                if (whdr.version != TWZM_VERSION)
-                    fprintf(stderr, "gguf-to-twzm: verify: wrong version\n"), mismatches++;
-                if (whdr.cached_model_ptr != 0) {
-                    fprintf(stderr, "gguf-to-twzm: verify: cached_model_ptr is non-zero "
-                            "(%" PRIu64 ") in freshly written file\n", whdr.cached_model_ptr);
-                    mismatches++;
-                }
-                if (whdr.tensor_count != (uint64_t)n_entries) {
-                    fprintf(stderr, "gguf-to-twzm: verify: tensor_count %" PRIu64
-                            " != expected %" PRId64 "\n", whdr.tensor_count, n_entries);
-                    mismatches++;
-                }
-                if (mismatches == 0)
-                    fprintf(stderr, "gguf-to-twzm: verify: header OK "
-                            "(%" PRIu64 " tensors)\n", whdr.tensor_count);
             }
+            if (whdr.tensor_count != (uint64_t)n_entries) {
+                fprintf(stderr, "gguf-to-twzm: verify: tensor_count %" PRIu64
+                        " != expected %" PRId64 "\n", whdr.tensor_count, n_entries);
+                mismatches++;
+            }
+            if (mismatches == 0)
+                fprintf(stderr, "gguf-to-twzm: verify: header OK "
+                        "(%" PRIu64 " tensors)\n", whdr.tensor_count);
         }
 
         // Re-open the GGUF to get tensor data offsets.
         struct gguf_context * vctx = gguf_init_from_file(in_path, gguf_params);
         if (!vctx) {
             fprintf(stderr, "gguf-to-twzm: verify: cannot re-parse GGUF\n");
+            twz_object_unmap(const_cast<uint8_t *>(dst_map), dst_size);
             return 1;
         }
         uint64_t vgguf_data_off = (uint64_t)gguf_get_data_offset(vctx);
 
-        FILE * fsrc = fopen(in_path,  "rb");
-        FILE * fdst = fopen(out_path, "rb");
-        if (!fsrc || !fdst) {
-            fprintf(stderr, "gguf-to-twzm: verify: cannot re-open files\n");
-            if (fsrc) fclose(fsrc);
-            if (fdst) fclose(fdst);
+        FILE * fsrc = fopen(in_path, "rb");
+        if (!fsrc) {
+            fprintf(stderr, "gguf-to-twzm: verify: cannot re-open '%s'\n", in_path);
             gguf_free(vctx);
+            twz_object_unmap(const_cast<uint8_t *>(dst_map), dst_size);
             return 1;
         }
 
         const size_t PROBE = 64; // bytes to compare per tensor
-        std::vector<uint8_t> src_buf(PROBE), dst_buf(PROBE);
+        std::vector<uint8_t> src_buf(PROBE);
 
         for (int64_t i = 0; i < n_tensors; ++i) {
             const char * name   = gguf_get_tensor_name(vctx, i);
@@ -485,27 +645,26 @@ int main(int argc, char ** argv) {
                 mismatches++;
                 continue;
             }
-            if (fseeko(fdst, (off_t)dst_off, SEEK_SET) != 0 ||
-                fread(dst_buf.data(), 1, probe, fdst) != probe) {
-                fprintf(stderr, "gguf-to-twzm: verify: cannot read TWZM for '%s'\n", name);
+            if (dst_off + probe > dst_size) {
+                fprintf(stderr, "gguf-to-twzm: verify: TWZM offset out of bounds for '%s'\n", name);
                 mismatches++;
                 continue;
             }
-            if (memcmp(src_buf.data(), dst_buf.data(), probe) != 0) {
+            if (memcmp(src_buf.data(), dst_map + dst_off, probe) != 0) {
                 fprintf(stderr, "gguf-to-twzm: verify: MISMATCH for '%s' at GGUF off=%" PRIu64 " TWZM off=%" PRIu64 "\n",
                         name, src_off, dst_off);
                 fprintf(stderr, "  gguf: ");
                 for (size_t b = 0; b < probe; ++b) fprintf(stderr, "%02x", src_buf[b]);
                 fprintf(stderr, "\n  twzm: ");
-                for (size_t b = 0; b < probe; ++b) fprintf(stderr, "%02x", dst_buf[b]);
+                for (size_t b = 0; b < probe; ++b) fprintf(stderr, "%02x", dst_map[dst_off + b]);
                 fprintf(stderr, "\n");
                 mismatches++;
             }
         }
 
         fclose(fsrc);
-        fclose(fdst);
         gguf_free(vctx);
+        twz_object_unmap(const_cast<uint8_t *>(dst_map), dst_size);
 
         if (mismatches == 0) {
             fprintf(stderr, "gguf-to-twzm: verify: all %" PRId64 " tensors OK\n", n_tensors);
@@ -518,8 +677,8 @@ int main(int argc, char ** argv) {
     return 0;
 
 fail:
-    fclose(fin);
-    fclose(fout);
+    if (fin) fclose(fin);
+    twz_object_finalize(obj, total_file_size);
     remove(out_path);
     gguf_free(gguf_ctx);
     return 1;
