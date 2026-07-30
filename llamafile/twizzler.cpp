@@ -196,13 +196,10 @@ static void twzm_set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
 
     const TwzmTensorEntry * entry = twzm_lookup(loader, name);
     if (!entry) {
-        if (loader->gguf_ctx &&
-            gguf_find_tensor(loader->gguf_ctx, name) >= 0) {
-            fprintf(stderr, "twzm: tensor '%s' is in GGUF metadata but missing "
-                            "from TWZM index (conversion bug?)\n", name);
-        } else {
-            TWZM_LOG_V("set_tensor_data: %-48s  SKIPPED (not in GGUF)", name);
-        }
+        // The index is the authoritative tensor table, so a miss just means the
+        // model doesn't have this tensor. create_tensor() has already thrown if
+        // it was a required one, so anything reaching here is optional.
+        TWZM_LOG_V("set_tensor_data: %-48s  SKIPPED (not in tensor index)", name);
         return;
     }
 
@@ -320,36 +317,13 @@ struct llama_model * llama_model_load_from_twzm(
     // Give the loader the context so it can classify missing tensors correctly.
     loader.gguf_ctx = gguf_ctx;
 
-    // 3. Handle weight tying: if output.weight is absent from the GGUF metadata
-    //    but IS present in the TWZM index (added by gguf_to_twzm), add a
-    //    synthetic gguf_context entry so create_tensor picks up the correct
-    //    quantised type rather than defaulting to F32.
-    if (gguf_find_tensor(gguf_ctx, "output.weight") < 0) {
-        const TwzmTensorEntry * out_entry = twzm_lookup(&loader, "output.weight");
-        int64_t tok_id = gguf_find_tensor(gguf_ctx, "token_embd.weight");
-        if (out_entry && tok_id >= 0) {
-            TWZM_LOG("weight tying: output.weight aliased to token_embd.weight in gguf_ctx");
+    // 3. Weight tying needs no special handling here any more. It used to
+    //    inject a synthetic output.weight into gguf_ctx so create_tensor would
+    //    pick up the tied tensor's quantised type instead of defaulting to
+    //    F32; since TWZM v3 the tensor index carries type and shape directly
+    //    and gguf_to_twzm already writes an output.weight alias entry into it,
+    //    so the loader reads the right type without any gguf involvement.
 
-            enum ggml_type type   = gguf_get_tensor_type(gguf_ctx, tok_id);
-            const int64_t * ne    = gguf_get_tensor_ne(gguf_ctx, tok_id);
-            int64_t blk           = (int64_t)ggml_blck_size(type);
-
-            struct ggml_tensor t  = {};
-            t.type    = type;
-            t.ne[0]   = ne[0];
-            t.ne[1]   = ne[1];
-            t.ne[2]   = 1;
-            t.ne[3]   = 1;
-            t.nb[0]   = ggml_type_size(type);
-            t.nb[1]   = (blk > 0) ? (t.nb[0] * t.ne[0] / blk) : (t.nb[0] * t.ne[0]);
-            t.nb[2]   = t.nb[1] * t.ne[1];
-            t.nb[3]   = t.nb[2] * t.ne[2];
-            strncpy(t.name, "output.weight", GGML_MAX_NAME - 1);
-
-            gguf_add_tensor(gguf_ctx, &t);
-        }
-    }
-    TWZM_STAGE("weight tying");
 
     // 4. Map the tensor-data object (required - referenced from the root
     //    header via TwzmHeader.tensor_data). Failure here is fatal: there is
@@ -428,8 +402,11 @@ struct llama_model * llama_model_load_from_twzm(
     params.use_mmap        = false;
     params.use_extra_bufts = false;
 
+    // Hand the mapped tensor index to the loader: since v3 it carries type and
+    // shape, so it - not the metadata blob - is the authoritative tensor table.
     struct llama_model * model =
-        llama_model_init_from_user(gguf_ctx, twzm_set_tensor_data, &loader, params, twzm_vocab_section);
+        llama_model_init_from_user(gguf_ctx, twzm_set_tensor_data, &loader, params, twzm_vocab_section,
+                                   loader.entries, loader.count);
     TWZM_STAGE("llama_model_init_from_user");
 
     if (!model) {

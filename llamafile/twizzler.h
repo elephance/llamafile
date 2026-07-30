@@ -83,7 +83,11 @@ typedef struct {
 // ---------------------------------------------------------------------------
 
 #define TWZM_MAGIC   0x4D5A5754u  // "TWZM" (little-endian)
-#define TWZM_VERSION 2u
+// v3: TwzmTensorEntry gained type/n_dims/ne, which lets the metadata blob drop
+// its tensor infos. v2 objects are not readable by a v3 loader (their index
+// entries are a different size and their blob is laid out differently) - they
+// must be regenerated with gguf-to-twzm.
+#define TWZM_VERSION 3u
 
 #define TWZM_TENSOR_NAME_MAX 96   // maximum tensor name length incl. NUL
 
@@ -113,11 +117,23 @@ typedef struct __attribute__((packed)) {
     TwzmGlobalPtr tensor_data;    // Tensor data object (required).
 } TwzmHeader;
 
-// One entry in the tensor index.
+// One entry in the tensor index. Sorted by name, so twzm_lookup() can bsearch.
+//
+// This is the authoritative tensor table: since v3 it carries `type` and `ne`
+// as well as the data location, which makes it self-sufficient and lets the
+// converter strip tensor infos out of the embedded GGUF metadata blob (the
+// same trick already used for the tokenizer arrays). That matters because
+// gguf_init_from_buffer() spent ~95% of its time constructing one
+// gguf_tensor_info per tensor - 0.52ms of 0.55ms on a 579-tensor MoE - while
+// the 35 KV pairs it actually still needs parse in 0.03ms. With the infos
+// gone, that stage stops scaling with tensor count entirely.
 typedef struct __attribute__((packed)) {
     char     name[TWZM_TENSOR_NAME_MAX]; // Tensor name (null-terminated).
     uint64_t data_offset;                // Byte offset within the tensor-data object.
     uint64_t data_size;                  // Byte length of the tensor data.
+    uint32_t type;                       // ggml_type of the tensor data.
+    uint32_t n_dims;                     // Number of significant entries in ne[].
+    int64_t  ne[4];                      // Dimensions; unused trailing entries are 1.
 } TwzmTensorEntry;
 
 // Alignment for tensor data regions (must be a power of two).

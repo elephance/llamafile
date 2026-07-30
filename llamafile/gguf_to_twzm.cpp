@@ -217,6 +217,19 @@ int main(int argc, char ** argv) {
         index[i].data_offset = next_data_off;
         index[i].data_size   = (uint64_t)tensor_size;
 
+        // Type and shape make the index self-sufficient, so the loader never
+        // needs a gguf_tensor_info and the blob can drop them (step 6).
+        index[i].type = (uint32_t)gguf_get_tensor_type(gguf_ctx, i);
+        const int64_t * ne = gguf_get_tensor_ne(gguf_ctx, i);
+        uint32_t n_dims = 1;
+        for (int d = 0; d < 4; ++d) {
+            index[i].ne[d] = ne[d];
+            if (ne[d] > 1) {
+                n_dims = (uint32_t)d + 1;
+            }
+        }
+        index[i].n_dims = n_dims;
+
         gguf_tensor_data_off[i] = next_data_off; // save before sorting
 
         next_data_off  = align_up(next_data_off + (uint64_t)tensor_size, TWZM_DATA_ALIGNMENT);
@@ -230,6 +243,9 @@ int main(int argc, char ** argv) {
         strncpy(e.name, "output.weight", TWZM_TENSOR_NAME_MAX - 1);
         e.data_offset = index[weight_tying_src].data_offset;
         e.data_size   = index[weight_tying_src].data_size;
+        e.type        = index[weight_tying_src].type;
+        e.n_dims      = index[weight_tying_src].n_dims;
+        memcpy(e.ne, index[weight_tying_src].ne, sizeof(e.ne));
     }
 
     // Sort all entries by name so the loader can use bsearch (zero allocation).
@@ -566,10 +582,17 @@ int main(int argc, char ** argv) {
     //    vocab object was created, the blob is copied verbatim as before so
     //    that fallback keeps working.
     // -----------------------------------------------------------------------
-    std::vector<uint8_t> meta_blob; // populated only when stripping
-    uint64_t metadata_size = gguf_data_offset; // verbatim source size by default
+    //    Tensor infos are ALWAYS stripped: since v3 the tensor index carries
+    //    type and shape, so it - not the blob - is the tensor table the loader
+    //    reads. Constructing one gguf_tensor_info per tensor was ~95% of
+    //    gguf_init_from_buffer()'s cost (0.52ms of 0.55ms at 579 tensors, and
+    //    growing with tensor count); the 35 KV pairs that remain parse in
+    //    0.03ms flat. This is why the blob is always re-emitted now rather than
+    //    copied verbatim.
+    std::vector<uint8_t> meta_blob;
+    uint64_t metadata_size = 0;
 
-    if (vocab_id.hi || vocab_id.lo) {
+    {
         struct gguf_context * mctx = gguf_init_from_file(in_path, gguf_params);
         if (!mctx) {
             fprintf(stderr, "gguf-to-twzm: cannot re-parse GGUF to build metadata blob\n");
@@ -579,6 +602,13 @@ int main(int argc, char ** argv) {
             gguf_free(gguf_ctx);
             return 1;
         }
+
+        // Emit KV pairs only - gguf_set_kv copies every key across but no
+        // tensor infos, so the result has n_tensors = 0.
+        struct gguf_context * kv_only = gguf_init_empty();
+        gguf_set_kv(kv_only, mctx);
+        gguf_free(mctx);
+        mctx = kv_only;
 
         // tokenizer.ggml.tokens doubles as the fallback source for n_vocab in
         // some architectures (ml.get_arr_n(LLM_KV_TOKENIZER_LIST, ...) when
@@ -597,14 +627,16 @@ int main(int argc, char ** argv) {
             }
         }
 
-        static const char * const strip_keys[] = {
-            "tokenizer.ggml.tokens",
-            "tokenizer.ggml.scores",
-            "tokenizer.ggml.token_type",
-            "tokenizer.ggml.merges",
-        };
-        for (const char * k : strip_keys) {
-            gguf_remove_key(mctx, k);
+        if (vocab_id.hi || vocab_id.lo) {
+            static const char * const strip_keys[] = {
+                "tokenizer.ggml.tokens",
+                "tokenizer.ggml.scores",
+                "tokenizer.ggml.token_type",
+                "tokenizer.ggml.merges",
+            };
+            for (const char * k : strip_keys) {
+                gguf_remove_key(mctx, k);
+            }
         }
 
         const size_t sz = gguf_get_meta_size(mctx);
@@ -614,9 +646,11 @@ int main(int argc, char ** argv) {
 
         metadata_size = (uint64_t)sz;
         fprintf(stderr, "gguf-to-twzm: metadata blob: %" PRIu64 " -> %" PRIu64 " bytes "
-                "(%.2f%%; tokenizer arrays stripped, vocab object supplies them)\n",
+                "(%.2f%%; tensor infos stripped (tensor index supplies them)%s)\n",
                 gguf_data_offset, metadata_size,
-                gguf_data_offset ? 100.0 * (double)metadata_size / (double)gguf_data_offset : 0.0);
+                gguf_data_offset ? 100.0 * (double)metadata_size / (double)gguf_data_offset : 0.0,
+                (vocab_id.hi || vocab_id.lo)
+                    ? ", tokenizer arrays stripped (vocab object supplies them)" : "");
     }
 
     const uint64_t root_total_size = metadata_off + metadata_size;
