@@ -50,6 +50,30 @@ o/$(MODE)/tests/extract_data_uris_test: \
 	$(CXX) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
 # ==============================================================================
+# Test: unicode_flags_test (build-time-generated codepoint flags table)
+# ==============================================================================
+#
+# Asserts llama.cpp/src/unicode-data-flags.cpp (generated, checked in) still
+# matches what unicode.cpp's reference algorithm would compute from the
+# checked-in unicode-data.cpp tables. Catches staleness if unicode-data.cpp is
+# ever regenerated.
+
+UNICODE_FLAGS_TEST_DEPS := \
+	o/$(MODE)/llama.cpp/src/unicode.cpp.o \
+	o/$(MODE)/llama.cpp/src/unicode-data.cpp.o \
+	o/$(MODE)/llama.cpp/src/unicode-data-flags.cpp.o
+
+o/$(MODE)/tests/unicode_flags_test.o: tests/unicode_flags_test.cpp
+	@mkdir -p $(@D)
+	$(CXX) $(CXXFLAGS) $(TESTS_CPPFLAGS) -c -o $@ $<
+
+o/$(MODE)/tests/unicode_flags_test: \
+		o/$(MODE)/tests/unicode_flags_test.o \
+		$(UNICODE_FLAGS_TEST_DEPS)
+	@mkdir -p $(@D)
+	$(CXX) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+
+# ==============================================================================
 # Test: fa_helpers_test (issue #975 numerical equivalence)
 # ==============================================================================
 #
@@ -203,6 +227,7 @@ o/$(MODE)/tests/transcribefile_smoke.runs: \
 .PHONY: o/$(MODE)/tests
 o/$(MODE)/tests: \
 	o/$(MODE)/tests/extract_data_uris_test.runs \
+	o/$(MODE)/tests/unicode_flags_test.runs \
 	o/$(MODE)/tests/fa_helpers_test.runs \
 	o/$(MODE)/tests/gpu_backend_test.runs \
 	o/$(MODE)/tests/sandbox_test.runs \

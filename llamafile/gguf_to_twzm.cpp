@@ -171,21 +171,24 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "gguf-to-twzm: %s\n", in_path);
     fprintf(stderr, "  tensors:         %" PRId64 "\n", n_tensors);
     fprintf(stderr, "  index entries:   %" PRId64 "\n", n_entries);
-    fprintf(stderr, "  metadata blob:   %" PRIu64 " bytes\n", gguf_data_offset);
+    fprintf(stderr, "  metadata blob:   %" PRIu64 " bytes (source)\n", gguf_data_offset);
 
     // -----------------------------------------------------------------------
     // 2. Compute layouts. The root object holds header + tensor index +
     //    metadata blob only; tensor data and vocab each live in their own
     //    dedicated object (see top-of-file comment), so their layouts are
     //    computed independently, each starting at offset 0.
+    //
+    //    metadata_size / root_total_size are NOT known yet: once a vocab
+    //    object exists, the tokenizer arrays are stripped from the root's
+    //    metadata blob (see step 6), which changes its size. They are
+    //    resolved after the vocab step.
     // -----------------------------------------------------------------------
     const uint64_t header_size       = (uint64_t)sizeof(TwzmHeader);
     const uint64_t entry_size        = (uint64_t)sizeof(TwzmTensorEntry);
     const uint64_t tensor_index_off  = header_size;
     const uint64_t tensor_index_size = (uint64_t)n_entries * entry_size;
     const uint64_t metadata_off      = tensor_index_off + tensor_index_size;
-    const uint64_t metadata_size     = gguf_data_offset;
-    const uint64_t root_total_size   = metadata_off + metadata_size;
 
     // Tensor-data object layout: page-aligned regions starting at offset 0.
     uint64_t next_data_off = 0;
@@ -238,7 +241,6 @@ int main(int argc, char ** argv) {
     const uint64_t tensor_data_total_size = next_data_off;
 
     fprintf(stderr, "  tensor data:     %" PRIu64 " bytes\n", total_tensor_bytes);
-    fprintf(stderr, "  root object:     %" PRIu64 " bytes\n", root_total_size);
     fprintf(stderr, "  tensor-data obj: %" PRIu64 " bytes\n", tensor_data_total_size);
 
     // -----------------------------------------------------------------------
@@ -546,7 +548,82 @@ int main(int argc, char ** argv) {
     }
 
     // -----------------------------------------------------------------------
-    // 6. Create the root object and write header + tensor index + metadata.
+    // 6. Build the root object's GGUF metadata blob.
+    //
+    //    When a vocab object exists, every token/merge the tokenizer needs is
+    //    already in it, precomputed - so the corresponding GGUF arrays in the
+    //    metadata blob are dead weight that gguf_init_from_buffer() would
+    //    still pay to parse into a std::vector<std::string> (one heap
+    //    allocation per element: ~128K tokens + ~280K merges for a Llama-3
+    //    class model, ~20ms and ~7.8MB of the root object). Strip them and
+    //    re-emit a compact blob instead of copying the source bytes verbatim.
+    //
+    //    NOT stripped: tokenizer.ggml.precompiled_charsmap, which UGM vocabs
+    //    read unconditionally and which the vocab object does not carry.
+    //
+    //    Consequence: the vocab object becomes REQUIRED for such a root - the
+    //    GGUF fallback vocab path can no longer construct a vocab. If no
+    //    vocab object was created, the blob is copied verbatim as before so
+    //    that fallback keeps working.
+    // -----------------------------------------------------------------------
+    std::vector<uint8_t> meta_blob; // populated only when stripping
+    uint64_t metadata_size = gguf_data_offset; // verbatim source size by default
+
+    if (vocab_id.hi || vocab_id.lo) {
+        struct gguf_context * mctx = gguf_init_from_file(in_path, gguf_params);
+        if (!mctx) {
+            fprintf(stderr, "gguf-to-twzm: cannot re-parse GGUF to build metadata blob\n");
+            twz_object_destroy(tensor_data_id);
+            twz_object_destroy(vocab_id);
+            fclose(fin);
+            gguf_free(gguf_ctx);
+            return 1;
+        }
+
+        // tokenizer.ggml.tokens doubles as the fallback source for n_vocab in
+        // some architectures (ml.get_arr_n(LLM_KV_TOKENIZER_LIST, ...) when
+        // <arch>.vocab_size is absent). Synthesize the scalar first so
+        // removing the array can't lose that information.
+        const int arch_idx = gguf_find_key(mctx, "general.architecture");
+        const int toks_idx = gguf_find_key(mctx, "tokenizer.ggml.tokens");
+        if (arch_idx >= 0 && toks_idx >= 0) {
+            char vs_key[256];
+            snprintf(vs_key, sizeof(vs_key), "%s.vocab_size", gguf_get_val_str(mctx, arch_idx));
+            if (gguf_find_key(mctx, vs_key) < 0) {
+                gguf_set_val_u32(mctx, vs_key, (uint32_t)gguf_get_arr_n(mctx, toks_idx));
+                fprintf(stderr, "gguf-to-twzm: synthesized '%s' = %zu "
+                        "(was only derivable from the stripped tokens array)\n",
+                        vs_key, gguf_get_arr_n(mctx, toks_idx));
+            }
+        }
+
+        static const char * const strip_keys[] = {
+            "tokenizer.ggml.tokens",
+            "tokenizer.ggml.scores",
+            "tokenizer.ggml.token_type",
+            "tokenizer.ggml.merges",
+        };
+        for (const char * k : strip_keys) {
+            gguf_remove_key(mctx, k);
+        }
+
+        const size_t sz = gguf_get_meta_size(mctx);
+        meta_blob.resize(sz);
+        gguf_get_meta_data(mctx, meta_blob.data());
+        gguf_free(mctx);
+
+        metadata_size = (uint64_t)sz;
+        fprintf(stderr, "gguf-to-twzm: metadata blob: %" PRIu64 " -> %" PRIu64 " bytes "
+                "(%.2f%%; tokenizer arrays stripped, vocab object supplies them)\n",
+                gguf_data_offset, metadata_size,
+                gguf_data_offset ? 100.0 * (double)metadata_size / (double)gguf_data_offset : 0.0);
+    }
+
+    const uint64_t root_total_size = metadata_off + metadata_size;
+    fprintf(stderr, "  root object:     %" PRIu64 " bytes\n", root_total_size);
+
+    // -----------------------------------------------------------------------
+    // 7. Create the root object and write header + tensor index + metadata.
     //    Written last, since the header embeds the tensor-data/vocab ids
     //    generated above.
     // -----------------------------------------------------------------------
@@ -575,7 +652,12 @@ int main(int argc, char ** argv) {
 
     memcpy(obj + tensor_index_off, index.data(), (size_t)tensor_index_size);
 
-    if (!copy_bytes(obj, metadata_off, fin, 0, metadata_size)) {
+    if (!meta_blob.empty()) {
+        // Stripped/re-emitted blob (step 6) - already in memory.
+        memcpy(obj + metadata_off, meta_blob.data(), meta_blob.size());
+    } else if (!copy_bytes(obj, metadata_off, fin, 0, metadata_size)) {
+        // No vocab object: copy the source metadata bytes verbatim so the
+        // GGUF fallback vocab path still has its tokenizer arrays.
         fprintf(stderr, "gguf-to-twzm: failed to copy GGUF metadata blob\n");
         twz_object_finalize(obj, root_total_size);
         remove(out_path);
@@ -594,7 +676,7 @@ int main(int argc, char ** argv) {
             "(same value used here) when loading this model later\n");
 
     // -----------------------------------------------------------------------
-    // 7. Optional verification: re-map all objects and spot-check each tensor.
+    // 8. Optional verification: re-map all objects and spot-check each tensor.
     // -----------------------------------------------------------------------
     if (verify) {
         fprintf(stderr, "gguf-to-twzm: verifying ...\n");

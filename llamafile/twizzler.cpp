@@ -381,36 +381,45 @@ struct llama_model * llama_model_load_from_twzm(
     }
     TWZM_STAGE("map tensor-data object");
 
-    // 5. Map the vocab object, if the root references one. Unlike tensor
-    //    data, this is optional and non-fatal: the GGUF metadata blob always
-    //    carries full tokenizer KV data, so a missing/bad vocab object just
-    //    falls back to the normal (slower) vocab-construction path.
+    // 5. Map the vocab object, if the root references one.
+    //
+    //    When the root carries a vocab reference, gguf_to_twzm has stripped
+    //    the (redundant) tokenizer arrays from the metadata blob, so there is
+    //    NO GGUF fallback vocab to fall back to - the vocab object is
+    //    required and any failure here is fatal. A root with no vocab
+    //    reference keeps its full metadata blob and uses the normal
+    //    (slower) GGUF vocab path instead.
     const void * twzm_vocab_section = nullptr;
     void * vocab_map_base = nullptr;
     size_t vocab_map_size = 0;
     if (hdr->vocab.id.hi != 0 || hdr->vocab.id.lo != 0) {
+        const char * vocab_err = nullptr;
         vocab_map_base = twz_object_map(hdr->vocab.id, &vocab_map_size);
         if (!vocab_map_base) {
-            fprintf(stderr, "twzm: warning: failed to map vocab object, "
-                            "falling back to normal vocab loading\n");
+            vocab_err = "failed to map vocab object";
         } else if (hdr->vocab.offset > vocab_map_size ||
                    vocab_map_size - hdr->vocab.offset < sizeof(TwzmVocabHeader)) {
-            fprintf(stderr, "twzm: warning: vocab object too small, "
-                            "falling back to normal vocab loading\n");
-            twz_object_unmap(vocab_map_base, vocab_map_size);
-            vocab_map_base = nullptr;
+            vocab_err = "vocab object too small";
         } else {
             const uint8_t * vsec = static_cast<const uint8_t *>(vocab_map_base) + hdr->vocab.offset;
             uint32_t vmagic;
             memcpy(&vmagic, vsec, sizeof(vmagic));
             if (vmagic != TWZM_VOCAB_MAGIC) {
-                fprintf(stderr, "twzm: warning: vocab object bad magic 0x%08X, "
-                                "falling back to normal vocab loading\n", vmagic);
-                twz_object_unmap(vocab_map_base, vocab_map_size);
-                vocab_map_base = nullptr;
+                vocab_err = "vocab object has bad magic";
             } else {
                 twzm_vocab_section = vsec;
             }
+        }
+        if (vocab_err) {
+            fprintf(stderr, "twzm: %s - this root object requires its vocab object "
+                            "(its metadata blob has no tokenizer arrays to fall back to)\n",
+                    vocab_err);
+            if (vocab_map_base) {
+                twz_object_unmap(vocab_map_base, vocab_map_size);
+            }
+            twz_object_unmap(td_map_base, td_map_size);
+            gguf_free(gguf_ctx);
+            return nullptr;
         }
     }
     TWZM_STAGE("map vocab object");

@@ -216,6 +216,7 @@ LLAMA_SRCS_CPP := \
 	llama.cpp/src/llama-sampler.cpp \
 	llama.cpp/src/llama-vocab.cpp \
 	llama.cpp/src/unicode-data.cpp \
+	llama.cpp/src/unicode-data-flags.cpp \
 	llama.cpp/src/unicode.cpp
 
 LLAMA_OBJS := $(LLAMA_SRCS_CPP:%.cpp=o/$(MODE)/%.cpp.o)
@@ -528,6 +529,11 @@ o/$(MODE)/llama.cpp/common/log.cpp.o: \
 # Unicode data - use gcc for better compatibility
 o/$(MODE)/llama.cpp/src/unicode-data.cpp.o: \
 	private CCFLAGS += -mgcc
+
+# Generated unicode flags table: a single ~2.2MB byte-string literal. Nothing to
+# optimize, and -O0 keeps the large generated source compiling quickly.
+o/$(MODE)/llama.cpp/src/unicode-data-flags.cpp.o: \
+	private CCFLAGS += -mgcc -O0
 
 # Core GGML and vector operations - optimize for performance
 o/$(MODE)/llama.cpp/ggml/src/ggml.c.o \
