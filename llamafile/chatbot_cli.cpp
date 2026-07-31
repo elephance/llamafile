@@ -51,6 +51,10 @@
 #include "sampling.h"
 
 #include "llamafile.h"
+#include "twizzler.h"
+#include "twizzler_platform.h"
+
+#include <inttypes.h>
 
 namespace lf {
 namespace chatbot {
@@ -178,6 +182,41 @@ int cli_main(int argc, char **argv) {
     // GPU layers default
     if (llamafile_has_metal() && params.n_gpu_layers < 0) {
         params.n_gpu_layers = INT_MAX;
+    }
+
+    // Acquire the KV cache object BEFORE the sandbox: pledging away open()
+    // is exactly the point, and this is the last moment we can obtain a
+    // writable descriptor. Sizing and mapping happen later (ftruncate/mmap on
+    // an already-open fd stay permitted), so the pledge below is unchanged.
+    //
+    // The cache is keyed by a model identity that must be computable here,
+    // before the model is loaded. A .twzm root already carries one (its
+    // tensor-data object id); a .gguf gets a content fingerprint instead, so
+    // prompt caching works without TWZM - the two are independent wins.
+    TwzmKvCache *kv_cache = nullptr;
+    twz_objid kv_model_id = {0, 0};
+    if (FLAG_prompt_cache) {
+        const char *mp = params.model.path.c_str();
+        const char *ext = strrchr(mp, '.');
+        if (ext && !strcmp(ext, ".twzm")) {
+            size_t root_sz = 0;
+            void *root = twz_object_map_at_path(mp, &root_sz);
+            if (root) {
+                kv_model_id = twzm_root_model_id(root, root_sz);
+                // Leave the root mapped: llama_model_load_from_twzm_path()
+                // below resolves the same path through the shim's mapping
+                // cache and would otherwise map it a second time.
+            }
+        } else {
+            kv_model_id = twzm_file_model_id(mp);
+        }
+        if (kv_model_id.hi || kv_model_id.lo) {
+            kv_cache = twzm_kv_cache_open(twzm_kv_cache_id(kv_model_id),
+                                          /*read_only=*/false);
+        } else {
+            fprintf(stderr, "warning: --prompt-cache: cannot identify model "
+                            "'%s'; caching disabled\n", mp);
+        }
     }
 
     // Drop network and filesystem-write access before the untrusted GGUF
@@ -403,8 +442,84 @@ int cli_main(int argc, char **argv) {
             return 5;
         }
 
-        // Evaluate prompt
-        for (int i = 0; i < (int)tokens.size(); i += params.n_batch) {
+        // Restore as much of the prompt as a previous run already computed.
+        //
+        // We reuse the first (n_match - 1) tokens and always decode from
+        // n_match - 1 onward, i.e. we deliberately re-decode the last matched
+        // token. That is what regenerates the logits: the saved state does NOT
+        // include them (llama.h's "logits, embedding and memory" comment is
+        // stale - state_write_data only writes the arch string and the memory
+        // module). Upstream handles this with an explicit
+        // common_replay_last_token() call; leaving one token for the normal
+        // decode loop achieves the same thing and cannot be forgotten.
+        int n_reuse = 0;
+        bool kv_up_to_date = false; // cache already holds exactly this prompt
+        if (kv_cache) {
+            uint32_t n_cached = 0;
+            const int32_t *cached = twzm_kv_cache_tokens(
+                kv_cache, kv_model_id, (uint32_t)params.n_ctx,
+                (uint32_t)params.cache_type_k, (uint32_t)params.cache_type_v,
+                &n_cached);
+            uint64_t blob_size = 0;
+            const void *blob = cached ? twzm_kv_cache_blob(kv_cache, &blob_size) : nullptr;
+
+            if (blob) {
+                size_t n_match = 0;
+                const size_t max_match = std::min((size_t)n_cached, tokens.size());
+                while (n_match < max_match && cached[n_match] == tokens[n_match])
+                    ++n_match;
+
+                // Rewriting a byte-identical cache costs a full state
+                // serialization (~200ms for a 410-token prompt, since
+                // llama_state_seq_get_data gathers per layer and, for
+                // transposed V, per embedding row). Repeat runs of the same
+                // prompt are the common case, so detect and skip it.
+                kv_up_to_date = (n_match == tokens.size() && n_cached == tokens.size());
+
+                // n_match < 2 leaves nothing worth reusing once the last
+                // matched token is given back to the decode loop.
+                if (n_match >= 2 &&
+                    llama_state_seq_set_data(ctx, (const uint8_t *)blob,
+                                             (size_t)blob_size, 0) != 0) {
+                    // TWZM_DEBUG>=2: prove the restore is byte-faithful by
+                    // round-tripping it straight back out before anything is
+                    // decoded. This is the real correctness invariant for the
+                    // cache. Output text is NOT a usable gate: llama.cpp's
+                    // matmul kernels are not batch-invariant (decoding a
+                    // prompt at -b 256 vs -b 1 already yields different text
+                    // with no cache involved), and restoring necessarily
+                    // changes how the prompt is batched.
+                    if (twzm_kv_debug_level() > 1) {
+                        const size_t rt_need = llama_state_seq_get_size(ctx, 0);
+                        std::vector<uint8_t> rt(rt_need);
+                        const size_t rt_got = llama_state_seq_get_data(ctx, rt.data(), rt_need, 0);
+                        fprintf(stderr,
+                                "twzm: [kv] roundtrip: %zu vs %" PRIu64 " bytes, %s\n",
+                                rt_got, blob_size,
+                                (rt_got == blob_size &&
+                                 !memcmp(rt.data(), blob, (size_t)blob_size))
+                                    ? "IDENTICAL" : "*** DIFFERS ***");
+                    }
+                    llama_memory_t mem = llama_get_memory(ctx);
+                    // Drop everything at or after the divergence point,
+                    // including the token we are about to re-decode.
+                    if (llama_memory_seq_rm(mem, 0, (llama_pos)(n_match - 1), -1)) {
+                        n_reuse = (int)n_match - 1;
+                    } else {
+                        // Recurrent/SWA memories cannot be partially removed.
+                        llama_memory_clear(mem, true);
+                    }
+                }
+                if (twzm_kv_debug_level() > 0)
+                    fprintf(stderr, "twzm: [kv] cached=%u prompt=%zu reused=%d\n",
+                            n_cached, tokens.size(), n_reuse);
+            }
+        }
+        if (n_reuse > 0)
+            log_stage("restore kv cache");
+
+        // Evaluate the remainder of the prompt
+        for (int i = n_reuse; i < (int)tokens.size(); i += params.n_batch) {
             int n_eval = std::min(params.n_batch, (int)tokens.size() - i);
             if (llama_decode(ctx, llama_batch_get_one(&tokens[i], n_eval))) {
                 fprintf(stderr, "error: failed to evaluate prompt\n");
@@ -414,6 +529,24 @@ int cli_main(int argc, char **argv) {
         }
         n_past = tokens.size();
         log_stage("evaluate prompt (text)");
+
+        // Persist the prompt's state for the next run. Done here rather than
+        // after generation so the cache holds exactly the prompt prefix: the
+        // generated continuation is sampled and would rarely be re-requested,
+        // and including it would make the stored token list diverge from any
+        // future prompt at the first generated token.
+        if (kv_cache && !tokens.empty() && !kv_up_to_date) {
+            const size_t need = llama_state_seq_get_size(ctx, 0);
+            std::vector<uint8_t> state(need);
+            const size_t got = llama_state_seq_get_data(ctx, state.data(), need, 0);
+            if (got > 0)
+                twzm_kv_cache_save(kv_cache, kv_model_id, (uint32_t)params.n_ctx,
+                                   (uint32_t)params.cache_type_k,
+                                   (uint32_t)params.cache_type_v,
+                                   tokens.data(), (uint32_t)tokens.size(),
+                                   state.data(), got);
+            log_stage("save kv cache");
+        }
     }
 
     // Install signal handler for graceful interrupt
@@ -504,6 +637,8 @@ int cli_main(int argc, char **argv) {
 
     // Cleanup
     cleanup(mtmd_ctx, sampler, ctx, model);
+    if (kv_cache)
+        twzm_kv_cache_close(kv_cache);
     log_stage("cleanup");
     llama_backend_free();
 

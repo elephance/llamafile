@@ -147,6 +147,7 @@ LLAMAFILE_SRCS_CPP := \
 	llamafile/chatbot_api.cpp \
 	llamafile/twizzler.cpp \
 	llamafile/twizzler_linux.cpp \
+	llamafile/twizzler_kvcache.cpp \
 	llamafile/chatbot_cli.cpp \
 	llamafile/chatbot_comm.cpp \
 	llamafile/chatbot_comp.cpp \

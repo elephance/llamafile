@@ -57,6 +57,7 @@
 // helpers-only file) shadows llama.cpp/include/llama.h in the include search.
 #include "../llama.cpp/include/llama.h"
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -213,6 +214,45 @@ typedef struct __attribute__((packed)) {
 } TwzmPieceEntry;
 
 // ---------------------------------------------------------------------------
+// KV cache object format (the entire content of a KV cache object)
+//
+// Prompt evaluation is pure recomputation: without a cache every run decodes
+// the whole prompt from n_past = 0, at roughly 15ms per token with no fixed
+// cost (measured: ~40 tokens = 178ms, ~370 tokens = 5542ms on a 1B model).
+// Persisting the KV state turns that into a memcpy of about 33KB per token.
+//
+// Unlike the vocab and tensor-data objects, a KV cache object is NOT
+// referenced from TwzmHeader: the root object is mapped MAP_PRIVATE, so a
+// TwzmGlobalPtr written into it at runtime would be copy-on-write and would
+// not survive the process. Instead the id is *derived* (see
+// twzm_kv_cache_id()) and resolved through the ordinary TWZ_OBJECT_PATH
+// convention, which needs no root mutation and no format version bump.
+//
+// Layout:
+//   TwzmKvHeader   (fixed)
+//   tokens[]       (n_tokens x 4 bytes)  llama_token, the prompt this covers
+//   blob           (blob_size bytes)     llama_state_seq_get_data() output
+// ---------------------------------------------------------------------------
+
+#define TWZM_KV_MAGIC   0x4D434B57u  // "WKCM"
+#define TWZM_KV_VERSION 1u
+
+typedef struct __attribute__((packed)) {
+    uint32_t  magic;          // TWZM_KV_MAGIC
+    uint32_t  version;        // TWZM_KV_VERSION
+    twz_objid model_id;       // must equal the root's TwzmHeader.tensor_data.id
+    uint32_t  n_ctx;          // context size the state was captured at
+    uint32_t  type_k;         // ggml_type of the K cache
+    uint32_t  type_v;         // ggml_type of the V cache
+    uint32_t  state_version;  // LLAMA_STATE_SEQ_VERSION at capture time
+    uint32_t  n_tokens;       // number of tokens in tokens[]
+    uint32_t  reserved;       // pad to 8-byte alignment; must be 0
+    uint64_t  tokens_offset;  // byte offset to tokens[]
+    uint64_t  blob_offset;    // byte offset to the state blob
+    uint64_t  blob_size;      // used bytes of the state blob
+} TwzmKvHeader;
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
@@ -251,6 +291,89 @@ struct llama_model * llama_model_load_from_twzm(
     const void * base,
     size_t size,
     struct llama_model_params params);
+
+// ---------------------------------------------------------------------------
+// KV cache (see TwzmKvHeader above)
+// ---------------------------------------------------------------------------
+
+// Derive the KV cache object id for a model. Purely a function of its input,
+// so any process can find the same cache without a registry or a pointer
+// stored in the root object.
+//
+// `model_id` should be the root's TwzmHeader.tensor_data.id, which is a random
+// 128-bit id minted per conversion and therefore a precise model identity: a
+// reconverted model gets a different id and so cannot collide with a stale
+// cache.
+//
+// Deliberately NOT keyed on n_ctx/type_k/type_v, even though a state blob is
+// only valid for the geometry it was captured at: the id must be computable
+// before the sandbox, and n_ctx is not final until the model has loaded (it is
+// clamped to the training context afterwards). Geometry is recorded in
+// TwzmKvHeader and checked on read instead, so a changed context size is a
+// clean miss that the next save overwrites. One cache per model, therefore;
+// alternating between two context sizes will thrash it.
+twz_objid twzm_kv_cache_id(twz_objid model_id);
+
+// Read the tensor_data object id out of a mapped root object, which is what
+// twzm_kv_cache_id() wants for `model_id`. Returns {0,0} if `base`/`size` is
+// not a valid TWZM root.
+twz_objid twzm_root_model_id(const void * base, size_t size);
+
+// Derive a model identity for a plain file (a .gguf), so the KV cache works
+// without the TWZM format - prompt caching and TWZM are independent wins and
+// should not be coupled.
+//
+// Fingerprints the file's size together with its leading bytes rather than
+// hashing it whole: a GGUF's header and KV metadata sit at the front and
+// already encode the architecture, every tensor's name, shape and type, so two
+// different models effectively always differ there, while a 1.3GB full hash
+// would cost more than the prompt evaluation being avoided. The trade-off is
+// that a model edited only in its weight bytes, keeping the same size and
+// metadata, would not be detected - which is why the geometry and llama state
+// version are still re-validated from TwzmKvHeader on every read.
+//
+// Opens the file, so it must be called before any privilege drop that removes
+// open(). Returns {0,0} if the file cannot be read.
+twz_objid twzm_file_model_id(const char * path);
+
+// An open KV cache. Acquired before a privilege drop, used after it.
+struct TwzmKvCache;
+
+// Acquire write access to the KV cache object for `cache_id` and map any
+// existing contents. MUST be called before llamafile_sandbox_enter(), since
+// it is the only step that needs open(). Never fails in a way that should
+// abort a run: on any error it returns a handle that simply reports no cached
+// state, and saving is skipped. `read_only` skips acquiring write access.
+struct TwzmKvCache * twzm_kv_cache_open(twz_objid cache_id, bool read_only);
+
+// Tokens covered by the cached state, or NULL when there is no usable cache.
+// Validates magic/version/model_id/geometry against the arguments; a mismatch
+// reports "no cache" rather than an error, so a stale object degrades to a
+// cold run. *out_n_tokens is set to 0 when NULL is returned.
+const int32_t * twzm_kv_cache_tokens(struct TwzmKvCache * kv,
+                                     twz_objid model_id, uint32_t n_ctx,
+                                     uint32_t type_k, uint32_t type_v,
+                                     uint32_t * out_n_tokens);
+
+// The cached state blob matching twzm_kv_cache_tokens(). NULL if absent.
+const void * twzm_kv_cache_blob(struct TwzmKvCache * kv, uint64_t * out_size);
+
+// Replace the cache contents. Grows the object as needed - safe after a
+// privilege drop, since the descriptor was acquired by twzm_kv_cache_open().
+// Returns false (and logs) on failure; callers should treat that as
+// non-fatal. No-op on a read-only or failed handle.
+bool twzm_kv_cache_save(struct TwzmKvCache * kv, twz_objid model_id,
+                        uint32_t n_ctx, uint32_t type_k, uint32_t type_v,
+                        const int32_t * tokens, uint32_t n_tokens,
+                        const void * blob, uint64_t blob_size);
+
+// Release the handle and its mappings.
+void twzm_kv_cache_close(struct TwzmKvCache * kv);
+
+// TWZM_DEBUG level, for callers that want to trace cache decisions alongside
+// this file's own logging. >=1 traces hits/misses; >=2 additionally enables
+// the caller-side restore round-trip check in chatbot_cli.cpp.
+int twzm_kv_debug_level(void);
 
 #ifdef __cplusplus
 } // extern "C"

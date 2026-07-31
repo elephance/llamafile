@@ -301,6 +301,66 @@ void twz_object_destroy(twz_objid id) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Deferred-mapping writable handles. See twizzler_platform.h for why these
+// exist (acquire write access before a privilege drop, size afterwards).
+// ---------------------------------------------------------------------------
+
+twz_handle twz_object_open_rw(twz_objid id) {
+    char path[4096];
+    if (!twz_object_path(id, path, sizeof(path))) {
+        fprintf(stderr, "twz_object_open_rw: path too long for object %016" PRIx64
+                "_%016" PRIx64 "\n", id.hi, id.lo);
+        return TWZ_HANDLE_INVALID;
+    }
+
+    twz_ensure_object_dir();
+
+    // No O_TRUNC: an existing object's contents must survive, since the
+    // caller may want to read the previous state before replacing it.
+    int fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+    if (fd < 0) {
+        fprintf(stderr, "twz_object_open_rw: cannot open '%s': %s\n",
+                path, strerror(errno));
+        return TWZ_HANDLE_INVALID;
+    }
+    return (twz_handle)fd;
+}
+
+long twz_object_handle_size(twz_handle h) {
+    if (h == TWZ_HANDLE_INVALID) {
+        return -1;
+    }
+    struct stat st;
+    if (fstat((int)h, &st) != 0) {
+        fprintf(stderr, "twz_object_handle_size: fstat failed: %s\n", strerror(errno));
+        return -1;
+    }
+    return (long)st.st_size;
+}
+
+void * twz_object_handle_map(twz_handle h, size_t size) {
+    if (h == TWZ_HANDLE_INVALID) {
+        return NULL;
+    }
+    if (size == 0) {
+        fprintf(stderr, "twz_object_handle_map: cannot map a zero-size object\n");
+        close((int)h);
+        return NULL;
+    }
+    // map_new_object() ftruncates, mmaps MAP_SHARED and registers the result
+    // in g_writable_mappings, so the handle-mapped object is indistinguishable
+    // from a created one for resize/finalize purposes. It closes the fd on
+    // failure, which is why this call consumes the handle either way.
+    return map_new_object((int)h, "<handle>", size);
+}
+
+void twz_object_close(twz_handle h) {
+    if (h != TWZ_HANDLE_INVALID) {
+        close((int)h);
+    }
+}
+
 void * twz_object_resize(void * base, size_t old_size, size_t new_size) {
     auto it = g_writable_mappings.find(base);
     if (it == g_writable_mappings.end()) {

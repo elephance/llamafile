@@ -13,6 +13,11 @@
 /*.bin
 /*.mp3
 
+# Twizzler object store (TWZ_OBJECT_PATH) and downloaded/converted models
+/twzm_objects
+/models
+/data
+
 .claude
 CLAUDE.md
 

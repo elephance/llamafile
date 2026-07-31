@@ -38,6 +38,7 @@ static bool is_llamafile_flag(const char* arg) {
            strcmp(arg, "--nothink") == 0 ||
            strcmp(arg, "--unsecure") == 0 ||
            strcmp(arg, "--confine-reads") == 0 ||
+           strcmp(arg, "--prompt-cache") == 0 ||
            strcmp(arg, "--version") == 0;
 }
 
@@ -94,6 +95,13 @@ LlamafileArgs parse_llamafile_args(int argc, char** argv) {
 
     // Check --confine-reads flag (opt-in unveil() path confinement, server mode)
     FLAG_confine_reads = llamafile_has(argv, "--confine-reads");
+
+    // Check --prompt-cache flag (persists the KV cache in a TWZM object so a
+    // later run with the same prompt prefix skips prompt evaluation). Handled
+    // here rather than via common_params_parse(): upstream's --prompt-cache is
+    // registered only for LLAMA_EXAMPLE_COMPLETION (common/arg.cpp:1640), so
+    // the CLI's LLAMA_EXAMPLE_CLI parse would reject it.
+    FLAG_prompt_cache = llamafile_has(argv, "--prompt-cache");
 
     // Filter out llamafile-specific arguments
     // These are not recognized by llama.cpp and would cause errors

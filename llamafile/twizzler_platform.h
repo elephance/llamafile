@@ -100,6 +100,51 @@ void * twz_object_create_fresh(twz_objid * out_id, size_t size);
 // twz_object_create_fresh()/twz_object_create().
 void twz_object_destroy(twz_objid id);
 
+// ---------------------------------------------------------------------------
+// Deferred-mapping writable handles (for writers that must acquire the right
+// to write BEFORE a privilege drop, but only learn the size afterwards).
+// ---------------------------------------------------------------------------
+//
+// The KV cache writer needs this: llamafile's CLI pledges "stdio rpath tty"
+// before the model is even loaded, so open() is unavailable by the time the
+// cache's size is known (it depends on how many tokens were decoded). Every
+// other writable entry point here opens and sizes in one shot, which is too
+// early.
+//
+// Splitting acquire from size lets the caller open the object while it still
+// may, then map it later at whatever size it turns out to need. ftruncate(),
+// mmap(MAP_SHARED), msync() and mremap() on an already-open descriptor all
+// remain permitted under that pledge (verified on Linux/SECCOMP).
+//
+// An opaque handle to a writable object. On Linux this is a file descriptor;
+// on Twizzler it is an object capability handle. TWZ_HANDLE_INVALID is the
+// failure value. Do not do arithmetic on it or assume it is an fd.
+typedef long twz_handle;
+#define TWZ_HANDLE_INVALID ((twz_handle)-1)
+
+// Acquire write access to an object without mapping or resizing it, creating
+// an empty one if it does not exist. Existing contents are preserved (unlike
+// twz_object_create*, which always truncate). Call before dropping
+// privileges. Returns TWZ_HANDLE_INVALID on failure.
+twz_handle twz_object_open_rw(twz_objid id);
+
+// Current size in bytes of a handle's object, or -1 on failure. Zero means
+// the object was just created (or is empty) and has nothing to read.
+long twz_object_handle_size(twz_handle h);
+
+// Resize the handle's object to `size` and map it read-write MAP_SHARED, as
+// twz_object_create() would. Usable after a privilege drop that forbids
+// open(). The result participates in twz_object_resize()/_finalize() exactly
+// like a created mapping; release it with twz_object_finalize().
+//
+// Consumes the handle: on success ownership passes to the mapping (which
+// closes it on finalize), and on failure the handle is closed. Either way the
+// caller must not reuse it, nor call twz_object_close() on it.
+void * twz_object_handle_map(twz_handle h, size_t size);
+
+// Release a handle that was never passed to twz_object_handle_map().
+void twz_object_close(twz_handle h);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif
