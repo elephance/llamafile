@@ -190,6 +190,10 @@ int cli_main(int argc, char **argv) {
     common_log_resume(common_log_main());
     if (sandbox == LLAMAFILE_SANDBOX_FAILED)
         return 1;
+    // Its own stage: installing the syscall filter costs ~7-9ms, which is now
+    // several times the model load itself. Folded into "load model" it looked
+    // like loading a 1.3GB model took 10ms when it actually takes ~1.5ms.
+    log_stage("enter sandbox");
 
     // Load model
     llama_model_params model_params = common_model_params_to_llama(params);

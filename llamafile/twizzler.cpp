@@ -256,16 +256,16 @@ struct llama_model * llama_model_load_from_twzm(
         size_t size,
         struct llama_model_params params) {
 
-    auto twzm_ms = [](int64_t t0) -> double {
-        struct timespec ts;
-        clock_gettime(CLOCK_MONOTONIC, &ts);
-        int64_t t1 = (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-        return (double)(t1 - t0);
-    };
+    // Microseconds, not milliseconds: these stages are now well under 1ms each,
+    // and integer-ms arithmetic quantised every one of them to a flat 0.0 while
+    // silently hiding up to 1ms apiece.
     auto twzm_now = []() -> int64_t {
         struct timespec ts;
         clock_gettime(CLOCK_MONOTONIC, &ts);
-        return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+        return (int64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+    };
+    auto twzm_ms = [&twzm_now](int64_t t0) -> double {
+        return (double)(twzm_now() - t0) / 1000.0;
     };
     const bool do_time = twzm_debug_level() > 0;
 #define TWZM_STAGE(label)  do { if (do_time) { \
